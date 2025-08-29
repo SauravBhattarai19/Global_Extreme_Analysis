@@ -822,7 +822,7 @@ def main():
                        help='Directory containing heatwave results')
     parser.add_argument('--rh-dir', default='data/processed/relative_humidity',
                        help='Directory containing RH data')
-    parser.add_argument('--percentile-file', 
+    parser.add_argument('--percentile-file', default = 'data/processed/rh_percentiles.nc',
                        help='Path to RH percentile file (for percentile mode)')
     parser.add_argument('--output-dir', default='data/processed/humidity_classification',
                        help='Output directory')
@@ -844,7 +844,7 @@ def main():
     # Processing parameters
     parser.add_argument('--variables', nargs='+', default=['tmax', 'tmin'],
                        help='Variables to process')
-    parser.add_argument('--n-processes', type=int, default=48,
+    parser.add_argument('--n-processes', type=int, default=16,
                        help='Number of processes')
     parser.add_argument('--chunk-size-lat', type=int, default=50,
                        help='Latitude chunk size')

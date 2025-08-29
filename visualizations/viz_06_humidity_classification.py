@@ -180,6 +180,15 @@ def apply_mask_and_adjust_colorbar(data, mask, percentile_range=(0.5, 99.5)):
     vmin = np.percentile(valid_data, percentile_range[0])
     vmax = np.percentile(valid_data, percentile_range[1])
     
+    # Ensure vmin < vmax
+    if vmin >= vmax:
+        vmin = np.min(valid_data)
+        vmax = np.max(valid_data)
+        # If still equal, add small range
+        if vmin == vmax:
+            vmin = vmin - 0.1
+            vmax = vmax + 0.1
+    
     return masked_data, vmin, vmax, len(valid_data)
 
 # Humidity category colors
@@ -359,10 +368,10 @@ def plot_global_humidity_patterns(aggregation_data, output_dir, mask_type='both'
                  HUMIDITY_COLORS['mixed-hot']]
         cmap3 = mcolors.ListedColormap(colors[1:])  # Exclude white
         
-        im3 = ax3.imshow(dominant_type, cmap=cmap3, vmin=1, vmax=3,
-                        extent=[aggregation_data.longitude.min(), aggregation_data.longitude.max(),
-                               aggregation_data.latitude.min(), aggregation_data.latitude.max()],
-                        transform=ccrs.PlateCarree())
+        # Use contourf instead of imshow for cartopy compatibility
+        levels_dom = [0.5, 1.5, 2.5, 3.5]
+        im3 = ax3.contourf(humid_mean.longitude, humid_mean.latitude, dominant_type, 
+                          levels=levels_dom, cmap=cmap3, transform=ccrs.PlateCarree())
         
         ax3.set_title(f'Dominant Heatwave Type ({var.upper()}, {mask_type.capitalize()})', 
                      fontsize=12, fontweight='bold')

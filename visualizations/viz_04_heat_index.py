@@ -198,16 +198,35 @@ HI_COLORS = {
     'Extreme Danger': '#8B0000'
 }
 
-def load_heat_index_data(hi_dir, years=None, sample_months=None):
+def load_heat_index_data(hi_dir, years=None, sample_months=None, start_year=None, end_year=None):
     """Load heat index data for analysis."""
     hi_dir = Path(hi_dir)
     
     if years is None:
         # Find available years
         hi_files = list(hi_dir.glob('era5_heat_index_*.nc'))
-        years = sorted(set([int(f.name.split('_')[3]) for f in hi_files]))
-        print(f"Found data for years: {years[0]}-{years[-1]}")
-        years = years[:5]  # Limit to first 5 years for visualization
+        all_years = sorted(set([int(f.name.split('_')[3]) for f in hi_files]))
+        print(f"Found data for years: {all_years[0]}-{all_years[-1]} (total: {len(all_years)} years)")
+        
+        # Apply start_year and end_year filters
+        if start_year is not None or end_year is not None:
+            start_yr = start_year if start_year is not None else all_years[0]
+            end_yr = end_year if end_year is not None else all_years[-1]
+            
+            # Validate year range
+            if start_yr < all_years[0]:
+                print(f"Warning: start_year {start_yr} is before earliest available year {all_years[0]}")
+                start_yr = all_years[0]
+            if end_yr > all_years[-1]:
+                print(f"Warning: end_year {end_yr} is after latest available year {all_years[-1]}")
+                end_yr = all_years[-1]
+            
+            # Filter years within the specified range
+            years = [yr for yr in all_years if start_yr <= yr <= end_yr]
+            print(f"Using years {start_yr}-{end_yr}: {len(years)} years")
+        else:
+            years = all_years
+            print(f"Using all {len(years)} years")
     
     if sample_months is None:
         sample_months = [1, 4, 7, 10]  # Jan, Apr, Jul, Oct
@@ -400,7 +419,17 @@ def plot_heat_index_categories(hi_ds, output_dir, mask_type='both'):
     
     for season in ['DJF', 'MAM', 'JJA', 'SON']:
         try:
-            season_data = hi_seasonal.sel(season=season).values
+            # Iterate through groups to find the matching season
+            season_found = False
+            for season_key, season_group in hi_seasonal:
+                if season_key == season:
+                    season_data = season_group.values
+                    season_found = True
+                    break
+            
+            if not season_found:
+                continue
+                
             # Apply mask to seasonal data
             season_mask_flat = np.broadcast_to(mask, season_data.shape).flatten()
             season_data_flat = season_data.flatten()
@@ -604,12 +633,21 @@ def plot_heat_index_relationships(hi_ds, rh_dir, temp_dir, output_dir, mask_type
         colors = ['blue', 'green', 'red', 'orange']
         
         for season, color in zip(seasons, colors):
-            if season in hi_seasonal.groups:
-                season_data = hi_seasonal.sel(season=season).mean(dim='longitude')
-                # Apply latitude-wise masking (simplified)
-                season_zonal = season_data.mean(dim=['valid_time'])
-                ax3.plot(season_zonal.latitude, season_zonal, color=color, linewidth=2, 
-                        label=season, alpha=0.8)
+            # Find the season in the groups
+            season_found = False
+            for season_key, season_group in hi_seasonal:
+                if season_key == season:
+                    season_data = season_group.mean(dim='longitude')
+                    season_found = True
+                    break
+            
+            if not season_found:
+                continue
+                
+            # Apply latitude-wise masking (simplified)
+            season_zonal = season_data.mean(dim=['valid_time'])
+            ax3.plot(season_zonal.latitude, season_zonal, color=color, linewidth=2, 
+                    label=season, alpha=0.8)
         
         # Add danger threshold lines
         for temp, color, alpha in [(27, 'yellow', 0.5), (32, 'orange', 0.5), 
@@ -689,6 +727,206 @@ def plot_heat_index_relationships(hi_ds, rh_dir, temp_dir, output_dir, mask_type
         
     except Exception as e:
         print(f"Note: Could not create relationship plots: {e}")
+
+def calculate_heat_index_trends(hi_ds, mask_type='both'):
+    """
+    Calculate spatial trends in heat index data.
+    
+    Args:
+        hi_ds: xarray Dataset with heat index data
+        mask_type: 'land', 'ocean', or 'both'
+    
+    Returns:
+        trends: array of trend slopes (per year)
+        p_values: array of p-values
+        significant: boolean array where True = significant trend
+    """
+    from scipy import stats
+    
+    # Create land/ocean mask
+    mask = create_land_ocean_mask(hi_ds, mask_type)
+    
+    # Get years for trend calculation
+    years = hi_ds.valid_time.dt.year.values
+    unique_years = np.unique(years)
+    
+    if len(unique_years) < 5:
+        print("Warning: Less than 5 years of data - trend analysis may be unreliable")
+        return None, None, None
+    
+    print(f"Calculating trends for {len(unique_years)} years: {unique_years[0]}-{unique_years[-1]}")
+    
+    # Calculate annual means for trend analysis
+    hi_annual = hi_ds.heat_index.groupby('valid_time.year').mean()
+    
+    # Initialize arrays
+    trends = np.full((len(hi_ds.latitude), len(hi_ds.longitude)), np.nan)
+    p_values = np.full((len(hi_ds.latitude), len(hi_ds.longitude)), np.nan)
+    significant = np.full((len(hi_ds.latitude), len(hi_ds.longitude)), False)
+    
+    # Calculate trends for each pixel
+    for i in range(len(hi_ds.latitude)):
+        for j in range(len(hi_ds.longitude)):
+            if mask[i, j]:  # Only calculate for masked pixels
+                pixel_data = hi_annual.isel(latitude=i, longitude=j).values
+                
+                if not np.any(np.isnan(pixel_data)) and len(pixel_data) >= 3:
+                    # Linear regression
+                    slope, intercept, r_value, p_value, std_err = stats.linregress(
+                        unique_years, pixel_data
+                    )
+                    
+                    trends[i, j] = slope
+                    p_values[i, j] = p_value
+                    significant[i, j] = p_value < 0.05  # 95% confidence level
+    
+    return trends, p_values, significant
+
+def plot_heat_index_trends(hi_ds, output_dir, mask_type='both'):
+    """Plot spatial trends in heat index data."""
+    output_dir = Path(output_dir)
+    
+    # Calculate trends
+    trends, p_values, significant = calculate_heat_index_trends(hi_ds, mask_type)
+    
+    if trends is None:
+        print("Insufficient data for trend analysis")
+        return
+    
+    # Create land/ocean mask
+    mask = create_land_ocean_mask(hi_ds, mask_type)
+    
+    fig, axes = plt.subplots(2, 2, figsize=(20, 16))
+    
+    # 1. Trend magnitude
+    ax1 = axes[0, 0]
+    
+    # Apply mask and calculate percentiles
+    trends_masked, vmin_trend, vmax_trend, valid_count_trend = apply_mask_and_adjust_colorbar(
+        trends, mask, percentile_range=(2.5, 97.5)
+    )
+    
+    # Convert to per-decade for better interpretation
+    trends_decade = trends_masked * 10
+    
+    im1 = ax1.contourf(hi_ds.longitude, hi_ds.latitude, trends_decade,
+                      levels=20, cmap='RdBu_r', transform=ccrs.PlateCarree(),
+                      extend='both', vmin=vmin_trend*10, vmax=vmax_trend*10)
+    
+    ax1.add_feature(cfeature.COASTLINE, linewidth=0.5)
+    ax1.add_feature(cfeature.BORDERS, linewidth=0.3)
+    ax1.set_global()
+    ax1.set_title(f'Heat Index Trends ({mask_type.capitalize()})\n'
+                  f'Change per decade (°C/decade)', fontsize=14, fontweight='bold', pad=20)
+    
+    cbar1 = plt.colorbar(im1, ax=ax1, orientation='horizontal', pad=0.08, shrink=0.8)
+    cbar1.set_label('Trend (°C/decade)', fontsize=12, fontweight='bold')
+    
+    # 2. Trend significance
+    ax2 = axes[0, 1]
+    
+    # Create significance mask
+    sig_masked = significant.copy()
+    sig_masked[~mask] = False
+    
+    # Plot significant trends only
+    sig_trends = trends_decade.copy()
+    sig_trends[~sig_masked] = np.nan
+    
+    im2 = ax2.contourf(hi_ds.longitude, hi_ds.latitude, sig_trends,
+                      levels=20, cmap='RdBu_r', transform=ccrs.PlateCarree(),
+                      extend='both', vmin=vmin_trend*10, vmax=vmax_trend*10)
+    
+    ax2.add_feature(cfeature.COASTLINE, linewidth=0.5)
+    ax2.add_feature(cfeature.BORDERS, linewidth=0.3)
+    ax2.set_global()
+    ax2.set_title(f'Significant Heat Index Trends ({mask_type.capitalize()})\n'
+                  f'p < 0.05 only', fontsize=14, fontweight='bold', pad=20)
+    
+    cbar2 = plt.colorbar(im2, ax=ax2, orientation='horizontal', pad=0.08, shrink=0.8)
+    cbar2.set_label('Trend (°C/decade)', fontsize=12, fontweight='bold')
+    
+    # 3. Trend direction summary
+    ax3 = axes[1, 0]
+    
+    # Classify trends
+    increasing = (trends_decade > 0) & sig_masked
+    decreasing = (trends_decade < 0) & sig_masked
+    no_trend = ~sig_masked & mask
+    
+    # Create categorical plot
+    trend_categories = np.full_like(trends_decade, np.nan)
+    trend_categories[increasing] = 1
+    trend_categories[decreasing] = -1
+    trend_categories[no_trend] = 0
+    
+    colors = ['blue', 'gray', 'red']
+    labels = ['Decreasing', 'No significant trend', 'Increasing']
+    
+    im3 = ax3.contourf(hi_ds.longitude, hi_ds.latitude, trend_categories,
+                      levels=[-1.5, -0.5, 0.5, 1.5], colors=colors,
+                      transform=ccrs.PlateCarree())
+    
+    ax3.add_feature(cfeature.COASTLINE, linewidth=0.5)
+    ax3.add_feature(cfeature.BORDERS, linewidth=0.3)
+    ax3.set_global()
+    ax3.set_title(f'Trend Direction Summary ({mask_type.capitalize()})', 
+                  fontsize=14, fontweight='bold', pad=20)
+    
+    # Add legend
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor=color, label=label) 
+                      for color, label in zip(colors, labels)]
+    ax3.legend(handles=legend_elements, loc='lower right', framealpha=0.8)
+    
+    # 4. Trend statistics
+    ax4 = axes[1, 1]
+    ax4.axis('off')
+    
+    # Calculate statistics
+    valid_trends = trends_decade[sig_masked]
+    if len(valid_trends) > 0:
+        increasing_pct = np.sum(valid_trends > 0) / len(valid_trends) * 100
+        decreasing_pct = np.sum(valid_trends < 0) / len(valid_trends) * 100
+        mean_trend = np.mean(valid_trends)
+        max_trend = np.max(valid_trends)
+        min_trend = np.min(valid_trends)
+        
+        stats_text = f"""
+        TREND STATISTICS
+        
+        Significant Trends (p < 0.05): {np.sum(sig_masked):,} pixels
+        
+        Direction:
+        • Increasing: {increasing_pct:.1f}%
+        • Decreasing: {decreasing_pct:.1f}%
+        
+        Magnitude:
+        • Mean trend: {mean_trend:.2f}°C/decade
+        • Maximum: {max_trend:.2f}°C/decade
+        • Minimum: {min_trend:.2f}°C/decade
+        
+        Period: {hi_ds.valid_time.dt.year.min().values}-{hi_ds.valid_time.dt.year.max().values}
+        """
+    else:
+        stats_text = "No significant trends found"
+    
+    ax4.text(0.5, 0.5, stats_text, transform=ax4.transAxes, 
+             fontsize=12, ha='center', va='center',
+             bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+    
+    plt.suptitle(f'Heat Index Trend Analysis ({mask_type.capitalize()})\n'
+                f'Period: {hi_ds.valid_time.dt.year.min().values}-{hi_ds.valid_time.dt.year.max().values}',
+                fontsize=16, fontweight='bold', y=0.95)
+    
+    plt.tight_layout()
+    
+    # Save
+    filename = f'heat_index_trends_{mask_type}.png'
+    plt.savefig(output_dir / filename, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Saved: {filename}")
 
 def plot_regional_heat_index_comparison(hi_ds, output_dir, mask_type='both'):
     """Compare heat index patterns across different regions."""
@@ -884,7 +1122,11 @@ def main():
     parser.add_argument('--temp-dir', default='/data/climate/disk3/datasets/era5',
                        help='Directory containing temperature files (for relationships)')
     parser.add_argument('--years', nargs='+', type=int,
-                       help='Specific years to analyze (default: first 5 available)')
+                       help='Specific years to analyze (default: all available)')
+    parser.add_argument('--start-year', type=int,
+                       help='Start year for analysis (default: earliest available)')
+    parser.add_argument('--end-year', type=int,
+                       help='End year for analysis (default: latest available)')
     parser.add_argument('--months', nargs='+', type=int, default=[1, 4, 7, 10],
                        help='Months to sample (default: 1 4 7 10)')
     parser.add_argument('--mask-type', choices=['land', 'ocean', 'both'], default='both',
@@ -903,6 +1145,9 @@ def main():
     print(f"Output directory: {args.output_dir}")
     print(f"Sample months: {args.months}")
     print(f"Analysis domain: {args.mask_type}")
+    if args.start_year or args.end_year:
+        year_range = f"{args.start_year or 'earliest'}-{args.end_year or 'latest'}"
+        print(f"Year range: {year_range}")
     print("="*80)
     
     # Create output directory
@@ -911,7 +1156,7 @@ def main():
     
     try:
         # Load data
-        hi_ds, file_info = load_heat_index_data(args.hi_dir, args.years, args.months)
+        hi_ds, file_info = load_heat_index_data(args.hi_dir, args.years, args.months, args.start_year, args.end_year)
         
         print("\nCreating visualizations...")
         
@@ -930,6 +1175,11 @@ def main():
         # 4. Regional comparison
         print("4. Regional comparison...")
         plot_regional_heat_index_comparison(hi_ds, output_dir, args.mask_type)
+        
+        # 5. Trend analysis (if requested and sufficient data)
+        if args.include_trends:
+            print("5. Trend analysis...")
+            plot_heat_index_trends(hi_ds, output_dir, args.mask_type)
         
         print("\n" + "="*80)
         print("HEAT INDEX VISUALIZATION COMPLETED!")
