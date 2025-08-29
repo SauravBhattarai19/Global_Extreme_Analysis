@@ -28,11 +28,159 @@ import pandas as pd
 import seaborn as sns
 from datetime import datetime
 import warnings
+try:
+    import regionmask
+    HAS_REGIONMASK = True
+except ImportError:
+    HAS_REGIONMASK = False
+    print("Note: regionmask not available - using simplified land/ocean mask")
 warnings.filterwarnings('ignore')
 
 # Set style
 plt.style.use('seaborn-v0_8-whitegrid')
 sns.set_palette("husl")
+
+def create_land_ocean_mask(ds, mask_type='both'):
+    """
+    Create accurate land/ocean mask using regionmask (if available) or cartopy.
+    
+    Args:
+        ds: xarray Dataset with latitude/longitude coordinates
+        mask_type: 'land', 'ocean', or 'both'
+    
+    Returns:
+        mask: Boolean array where True = include pixel, False = exclude
+    """
+    if mask_type == 'both':
+        return np.ones((len(ds.latitude), len(ds.longitude)), dtype=bool)
+    
+    lat = ds.latitude.values
+    lon = ds.longitude.values
+    
+    print(f"Creating {mask_type} mask...")
+    print(f"  Grid: {len(lat)} x {len(lon)} pixels")
+    
+    if HAS_REGIONMASK:
+        try:
+            # Use regionmask with Natural Earth land boundaries
+            print("  Using regionmask with Natural Earth boundaries...")
+            
+            # Create a dummy dataset with coordinates named as regionmask expects
+            dummy_ds = xr.Dataset(coords={'lat': lat, 'lon': lon})
+            
+            # Get Natural Earth land boundaries
+            land_mask_rm = regionmask.defined_regions.natural_earth_v5_0_0.land_110.mask(dummy_ds)
+            
+            # Convert to boolean (regionmask returns integers)
+            land_mask = ~np.isnan(land_mask_rm.values)
+            
+            print(f"  Land pixels: {np.sum(land_mask):,} ({np.sum(land_mask)/land_mask.size*100:.1f}%)")
+            print(f"  Ocean pixels: {np.sum(~land_mask):,} ({np.sum(~land_mask)/land_mask.size*100:.1f}%)")
+            
+            if mask_type == 'land':
+                return land_mask
+            elif mask_type == 'ocean':
+                return ~land_mask
+            else:
+                return np.ones_like(land_mask, dtype=bool)
+                
+        except Exception as e:
+            print(f"  regionmask failed: {e}")
+            print("  Falling back to cartopy...")
+    
+    # Fallback: Use cartopy's built-in land feature
+    print("  Using cartopy Natural Earth features...")
+    
+    try:
+        # Use cartopy's natural earth land feature
+        import cartopy.io.shapereader as shpreader
+        
+        # Get land geometries
+        land_shp = shpreader.natural_earth(resolution='50m', category='physical', name='land')
+        land_geoms = list(shpreader.Reader(land_shp).geometries())
+        
+        # Create mask efficiently
+        land_mask = np.zeros((len(lat), len(lon)), dtype=bool)
+        
+        # Create coordinate meshgrid
+        lon_grid, lat_grid = np.meshgrid(lon, lat)
+        
+        # Vectorized point-in-polygon test (more efficient)
+        from shapely.geometry import Point
+        from shapely.prepared import prep
+        
+        # Prepare geometries for faster intersection
+        prepared_geoms = [prep(geom) for geom in land_geoms]
+        
+        # Check each point
+        for i in range(len(lat)):
+            for j in range(len(lon)):
+                point = Point(lon[j], lat[i])
+                for prep_geom in prepared_geoms:
+                    if prep_geom.contains(point):
+                        land_mask[i, j] = True
+                        break
+        
+        print(f"  Land pixels: {np.sum(land_mask):,} ({np.sum(land_mask)/land_mask.size*100:.1f}%)")
+        print(f"  Ocean pixels: {np.sum(~land_mask):,} ({np.sum(~land_mask)/land_mask.size*100:.1f}%)")
+        
+        if mask_type == 'land':
+            return land_mask
+        elif mask_type == 'ocean':
+            return ~land_mask
+        else:
+            return np.ones_like(land_mask, dtype=bool)
+            
+    except Exception as e:
+        print(f"  Error creating land mask: {e}")
+        print("  Using simplified approximation...")
+        
+        # Last resort: very simplified land/ocean approximation
+        lat_grid, lon_grid = np.meshgrid(lat, lon, indexing='ij')
+        
+        # Very basic land approximation (major continents only)
+        land_mask = np.zeros_like(lat_grid, dtype=bool)
+        
+        # Continents (very rough)
+        land_mask |= (lat_grid >= -60) & (lat_grid <= 75) & (lon_grid >= -170) & (lon_grid <= -30)  # Americas
+        land_mask |= (lat_grid >= -35) & (lat_grid <= 75) & (lon_grid >= -20) & (lon_grid <= 180)   # Eurasia+Africa
+        land_mask |= (lat_grid >= -50) & (lat_grid <= -10) & (lon_grid >= 110) & (lon_grid <= 180)  # Australia
+        
+        if mask_type == 'land':
+            return land_mask
+        elif mask_type == 'ocean':
+            return ~land_mask
+        else:
+            return np.ones_like(land_mask, dtype=bool)
+
+def apply_mask_and_adjust_colorbar(data, mask, percentile_range=(0.5, 99.5)):
+    """
+    Apply mask to data and calculate appropriate colorbar range.
+    
+    Args:
+        data: numpy array of data values
+        mask: boolean mask (True = include)
+        percentile_range: tuple of (low, high) percentiles for colorbar
+    
+    Returns:
+        masked_data: data with mask applied (NaN where mask is False)
+        vmin, vmax: colorbar range values
+        valid_count: number of valid pixels
+    """
+    # Apply mask
+    masked_data = data.copy()
+    masked_data[~mask] = np.nan
+    
+    # Calculate colorbar range from masked data
+    valid_data = masked_data[~np.isnan(masked_data)]
+    
+    if len(valid_data) == 0:
+        return masked_data, 0, 1, 0
+    
+    vmin = np.percentile(valid_data, percentile_range[0])
+    vmax = np.percentile(valid_data, percentile_range[1])
+    
+    return masked_data, vmin, vmax, len(valid_data)
 
 # Compound event colors
 COMPOUND_COLORS = {
@@ -98,13 +246,16 @@ def load_precipitation_analysis_data(precip_dir, years=None):
     
     return combined_events, combined_analysis, aggregation_data
 
-def plot_compound_event_patterns(aggregation_data, output_dir):
+def plot_compound_event_patterns(aggregation_data, output_dir, mask_type='both'):
     """Create global maps of compound event patterns."""
     output_dir = Path(output_dir)
     
     if not aggregation_data or len(aggregation_data.data_vars) == 0:
         print("No aggregation data available for compound event analysis")
         return
+    
+    # Create land/ocean mask
+    mask = create_land_ocean_mask(aggregation_data, mask_type)
     
     # Calculate multi-year means
     compound_vars = [
@@ -127,46 +278,54 @@ def plot_compound_event_patterns(aggregation_data, output_dir):
         
         data = aggregation_data[var_name].mean(dim='year')
         
+        # Apply mask and calculate levels
+        data_masked, vmin, vmax, valid_count = apply_mask_and_adjust_colorbar(
+            data.values, mask, percentile_range=(0.5, 99.5)
+        )
+        
         # Color scheme based on event type
         if 'drought' in var_name:
             cmap = plt.cm.Reds
-            levels = np.arange(0, 3.1, 0.2)
         elif 'wet' in var_name:
             cmap = plt.cm.Blues
-            levels = np.arange(0, 1.1, 0.1)
         else:
             cmap = plt.cm.YlOrRd
-            levels = np.arange(0, 2.1, 0.2)
         
-        im = ax.contourf(data.longitude, data.latitude, data,
+        levels = np.linspace(vmin, vmax, 20)
+        
+        im = ax.contourf(data.longitude, data.latitude, data_masked,
                         levels=levels, cmap=cmap, transform=ccrs.PlateCarree(),
                         extend='max')
         
-        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.set_title(f'{title} ({mask_type.capitalize()})\n({valid_count:,} valid pixels)', 
+                    fontsize=12, fontweight='bold')
         
         cbar = plt.colorbar(im, ax=ax, shrink=0.8)
         cbar.set_label('Events per year', fontsize=10)
     
-    plt.suptitle(f'Compound Event Patterns\n'
+    plt.suptitle(f'Compound Event Patterns ({mask_type.capitalize()})\n'
                 f'Period: {aggregation_data.year.min().values}-{aggregation_data.year.max().values}',
                 fontsize=16, fontweight='bold', y=0.95)
     
     plt.tight_layout()
     
     # Save
-    filename = 'compound_event_patterns.png'
+    filename = f'compound_event_patterns_{mask_type}.png'
     plt.savefig(output_dir / filename, dpi=300, bbox_inches='tight')
     plt.close()
     
     print(f"Saved: {filename}")
 
-def plot_precipitation_recovery_analysis(aggregation_data, output_dir):
+def plot_precipitation_recovery_analysis(aggregation_data, output_dir, mask_type='both'):
     """Analyze precipitation recovery patterns after heatwaves."""
     output_dir = Path(output_dir)
     
     if not aggregation_data or len(aggregation_data.data_vars) == 0:
         print("No aggregation data available for recovery analysis")
         return
+    
+    # Create land/ocean mask
+    mask = create_land_ocean_mask(aggregation_data, mask_type)
     
     fig = plt.figure(figsize=(20, 12))
     
@@ -188,6 +347,11 @@ def plot_precipitation_recovery_analysis(aggregation_data, output_dir):
         
         data = aggregation_data[var_name].mean(dim='year')
         
+        # Apply mask and calculate levels
+        data_masked, vmin, vmax, valid_count = apply_mask_and_adjust_colorbar(
+            data.values, mask, percentile_range=(0.5, 99.5)
+        )
+        
         # Color scheme based on recovery type
         if 'immediate' in var_name:
             cmap = plt.cm.Greens
@@ -196,13 +360,14 @@ def plot_precipitation_recovery_analysis(aggregation_data, output_dir):
         else:  # persistent
             cmap = plt.cm.Reds
         
-        levels = np.arange(0, 2.1, 0.2)
+        levels = np.linspace(vmin, vmax, 15)
         
-        im = ax.contourf(data.longitude, data.latitude, data,
+        im = ax.contourf(data.longitude, data.latitude, data_masked,
                         levels=levels, cmap=cmap, transform=ccrs.PlateCarree(),
                         extend='max')
         
-        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.set_title(f'{title} ({mask_type.capitalize()})\n({valid_count:,} valid pixels)', 
+                    fontsize=12, fontweight='bold')
         
         cbar = plt.colorbar(im, ax=ax, shrink=0.8)
         cbar.set_label('Events per year', fontsize=10)
@@ -225,38 +390,44 @@ def plot_precipitation_recovery_analysis(aggregation_data, output_dir):
         
         data = aggregation_data[var_name].mean(dim='year')
         
+        # Apply mask and calculate levels
+        data_masked, vmin, vmax, valid_count = apply_mask_and_adjust_colorbar(
+            data.values, mask, percentile_range=(0.5, 99.5)
+        )
+        
         if 'days_to_first' in var_name:
             cmap = plt.cm.plasma
-            levels = np.arange(0, 31, 2)
             cbar_label = 'Days'
         else:
             cmap = plt.cm.Blues
-            levels = np.arange(0, 21, 2)
             cbar_label = 'Precipitation (mm)'
         
-        im = ax.contourf(data.longitude, data.latitude, data,
+        levels = np.linspace(vmin, vmax, 15)
+        
+        im = ax.contourf(data.longitude, data.latitude, data_masked,
                         levels=levels, cmap=cmap, transform=ccrs.PlateCarree(),
                         extend='max')
         
-        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.set_title(f'{title} ({mask_type.capitalize()})\n({valid_count:,} valid pixels)', 
+                    fontsize=12, fontweight='bold')
         
         cbar = plt.colorbar(im, ax=ax, shrink=0.8)
         cbar.set_label(cbar_label, fontsize=10)
     
-    plt.suptitle(f'Precipitation Recovery Analysis\n'
+    plt.suptitle(f'Precipitation Recovery Analysis ({mask_type.capitalize()})\n'
                 f'Period: {aggregation_data.year.min().values}-{aggregation_data.year.max().values}',
                 fontsize=16, fontweight='bold', y=0.95)
     
     plt.tight_layout()
     
     # Save
-    filename = 'precipitation_recovery_analysis.png'
+    filename = f'precipitation_recovery_analysis_{mask_type}.png'
     plt.savefig(output_dir / filename, dpi=300, bbox_inches='tight')
     plt.close()
     
     print(f"Saved: {filename}")
 
-def plot_event_precipitation_analysis(events_data, output_dir):
+def plot_event_precipitation_analysis(events_data, output_dir, mask_type='both'):
     """Analyze precipitation characteristics of individual events."""
     output_dir = Path(output_dir)
     
@@ -275,7 +446,7 @@ def plot_event_precipitation_analysis(events_data, output_dir):
         
         wedges, texts, autotexts = ax1.pie(event_counts.values, labels=event_counts.index,
                                           colors=colors, autopct='%1.1f%%', startangle=90)
-        ax1.set_title('Compound Event Type Distribution', fontweight='bold')
+        ax1.set_title(f'Compound Event Type Distribution ({mask_type.capitalize()})', fontweight='bold')
     
     # 2. Precipitation pattern distribution
     ax2 = axes[0, 1]
@@ -287,7 +458,7 @@ def plot_event_precipitation_analysis(events_data, output_dir):
         ax2.bar(pattern_counts.index, pattern_counts.values, color=colors, alpha=0.7)
         ax2.set_xlabel('Precipitation Pattern')
         ax2.set_ylabel('Number of Events')
-        ax2.set_title('Precipitation Pattern Distribution', fontweight='bold')
+        ax2.set_title(f'Precipitation Pattern Distribution ({mask_type.capitalize()})', fontweight='bold')
         plt.setp(ax2.get_xticklabels(), rotation=45, ha='right')
         ax2.grid(True, alpha=0.3)
     
@@ -298,16 +469,22 @@ def plot_event_precipitation_analysis(events_data, output_dir):
         pre_precip = events_data['pre_hw_total_precip'].dropna()
         during_precip = events_data['during_hw_total_precip'].dropna()
         
-        ax3.scatter(pre_precip, during_precip, alpha=0.6, s=20)
-        ax3.set_xlabel('Pre-Heatwave Precipitation (mm)')
-        ax3.set_ylabel('During-Heatwave Precipitation (mm)')
-        ax3.set_title('Pre vs During Heatwave Precipitation', fontweight='bold')
-        ax3.grid(True, alpha=0.3)
-        
-        # Add diagonal line
-        max_val = max(pre_precip.max(), during_precip.max())
-        ax3.plot([0, max_val], [0, max_val], 'k--', alpha=0.5, label='1:1 line')
-        ax3.legend()
+        # Only plot points where both values exist
+        mask_both = events_data['pre_hw_total_precip'].notna() & events_data['during_hw_total_precip'].notna()
+        if mask_both.any():
+            pre_both = events_data.loc[mask_both, 'pre_hw_total_precip']
+            during_both = events_data.loc[mask_both, 'during_hw_total_precip']
+            
+            ax3.scatter(pre_both, during_both, alpha=0.6, s=20)
+            ax3.set_xlabel('Pre-Heatwave Precipitation (mm)')
+            ax3.set_ylabel('During-Heatwave Precipitation (mm)')
+            ax3.set_title(f'Pre vs During Heatwave Precipitation ({mask_type.capitalize()})', fontweight='bold')
+            ax3.grid(True, alpha=0.3)
+            
+            # Add diagonal line
+            max_val = max(pre_both.max(), during_both.max()) if len(pre_both) > 0 else 1
+            ax3.plot([0, max_val], [0, max_val], 'k--', alpha=0.5, label='1:1 line')
+            ax3.legend()
     
     # 4. Recovery time distribution
     ax4 = axes[1, 1]
@@ -322,7 +499,7 @@ def plot_event_precipitation_analysis(events_data, output_dir):
             ax4.hist(recovery_times, bins=range(1, 32), alpha=0.7, color='skyblue', edgecolor='black')
             ax4.set_xlabel('Days to First Precipitation')
             ax4.set_ylabel('Number of Events')
-            ax4.set_title('Post-Heatwave Recovery Time', fontweight='bold')
+            ax4.set_title(f'Post-Heatwave Recovery Time ({mask_type.capitalize()})', fontweight='bold')
             ax4.grid(True, alpha=0.3)
             
             # Add statistics
@@ -331,26 +508,29 @@ def plot_event_precipitation_analysis(events_data, output_dir):
                        label=f'Mean: {mean_recovery:.1f} days')
             ax4.legend()
     
-    plt.suptitle(f'Event-Level Precipitation Analysis\n'
+    plt.suptitle(f'Event-Level Precipitation Analysis ({mask_type.capitalize()})\n'
                 f'Total Events: {len(events_data):,}',
                 fontsize=16, fontweight='bold', y=0.95)
     
     plt.tight_layout()
     
     # Save
-    filename = 'event_precipitation_analysis.png'
+    filename = f'event_precipitation_analysis_{mask_type}.png'
     plt.savefig(output_dir / filename, dpi=300, bbox_inches='tight')
     plt.close()
     
     print(f"Saved: {filename}")
 
-def plot_temporal_precipitation_trends(aggregation_data, events_data, output_dir):
+def plot_temporal_precipitation_trends(aggregation_data, events_data, output_dir, mask_type='both'):
     """Plot temporal trends in precipitation-heatwave interactions."""
     output_dir = Path(output_dir)
     
     if not aggregation_data or 'year' not in aggregation_data.dims or len(aggregation_data.year) < 3:
         print("Insufficient years for trend analysis")
         return
+    
+    # Create land/ocean mask
+    mask = create_land_ocean_mask(aggregation_data, mask_type)
     
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     
@@ -364,13 +544,21 @@ def plot_temporal_precipitation_trends(aggregation_data, events_data, output_dir
     
     for var, color in zip(compound_vars, colors):
         if var in aggregation_data.data_vars:
-            global_mean = aggregation_data[var].mean(dim=['latitude', 'longitude'])
-            ax1.plot(years, global_mean, 'o-', color=color, 
+            # Calculate global means with masking
+            global_means = []
+            for year in years:
+                year_data = aggregation_data[var].sel(year=year).values
+                year_masked = year_data.copy()
+                year_masked[~mask] = np.nan
+                global_means.append(np.nanmean(year_masked))
+            
+            global_means = np.array(global_means)
+            ax1.plot(years, global_means, 'o-', color=color, 
                     label=var.replace('_', ' ').title(), linewidth=2, markersize=6)
     
     ax1.set_xlabel('Year')
-    ax1.set_ylabel('Global Mean Events/Year')
-    ax1.set_title('Compound Event Trends', fontweight='bold')
+    ax1.set_ylabel('Mean Events/Year')
+    ax1.set_title(f'Compound Event Trends ({mask_type.capitalize()})', fontweight='bold')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     
@@ -382,13 +570,21 @@ def plot_temporal_precipitation_trends(aggregation_data, events_data, output_dir
     
     for var, color in zip(recovery_vars, colors):
         if var in aggregation_data.data_vars:
-            global_mean = aggregation_data[var].mean(dim=['latitude', 'longitude'])
-            ax2.plot(years, global_mean, 'o-', color=color,
+            # Calculate global means with masking
+            global_means = []
+            for year in years:
+                year_data = aggregation_data[var].sel(year=year).values
+                year_masked = year_data.copy()
+                year_masked[~mask] = np.nan
+                global_means.append(np.nanmean(year_masked))
+            
+            global_means = np.array(global_means)
+            ax2.plot(years, global_means, 'o-', color=color,
                     label=var.replace('_', ' ').title(), linewidth=2, markersize=6)
     
     ax2.set_xlabel('Year')
-    ax2.set_ylabel('Global Mean Events/Year')
-    ax2.set_title('Recovery Pattern Trends', fontweight='bold')
+    ax2.set_ylabel('Mean Events/Year')
+    ax2.set_title(f'Recovery Pattern Trends ({mask_type.capitalize()})', fontweight='bold')
     ax2.legend()
     ax2.grid(True, alpha=0.3)
     
@@ -401,13 +597,21 @@ def plot_temporal_precipitation_trends(aggregation_data, events_data, output_dir
     
     for var, color, label in zip(precip_vars, colors, labels):
         if var in aggregation_data.data_vars:
-            global_mean = aggregation_data[var].mean(dim=['latitude', 'longitude'])
-            ax3.plot(years, global_mean, 'o-', color=color,
+            # Calculate global means with masking
+            global_means = []
+            for year in years:
+                year_data = aggregation_data[var].sel(year=year).values
+                year_masked = year_data.copy()
+                year_masked[~mask] = np.nan
+                global_means.append(np.nanmean(year_masked))
+            
+            global_means = np.array(global_means)
+            ax3.plot(years, global_means, 'o-', color=color,
                     label=label, linewidth=2, markersize=6)
     
     ax3.set_xlabel('Year')
     ax3.set_ylabel('Mean Precipitation (mm)')
-    ax3.set_title('Post-Heatwave Precipitation Trends', fontweight='bold')
+    ax3.set_title(f'Post-Heatwave Precipitation Trends ({mask_type.capitalize()})', fontweight='bold')
     ax3.legend()
     ax3.grid(True, alpha=0.3)
     
@@ -425,28 +629,28 @@ def plot_temporal_precipitation_trends(aggregation_data, events_data, output_dir
             
             ax4.set_xlabel('Year')
             ax4.set_ylabel('Number of Events')
-            ax4.set_title('Precipitation Pattern Trends', fontweight='bold')
+            ax4.set_title(f'Precipitation Pattern Trends ({mask_type.capitalize()})', fontweight='bold')
             ax4.legend()
             ax4.grid(True, alpha=0.3)
         else:
             ax4.text(0.5, 0.5, 'Insufficient data\nfor pattern trends', 
                     ha='center', va='center', transform=ax4.transAxes, fontsize=14)
-            ax4.set_title('Precipitation Pattern Analysis', fontweight='bold')
+            ax4.set_title(f'Precipitation Pattern Analysis ({mask_type.capitalize()})', fontweight='bold')
     
-    plt.suptitle(f'Temporal Trends in Precipitation-Heatwave Interactions\n'
+    plt.suptitle(f'Temporal Trends in Precipitation-Heatwave Interactions ({mask_type.capitalize()})\n'
                 f'Period: {years[0]}-{years[-1]}',
                 fontsize=16, fontweight='bold', y=0.95)
     
     plt.tight_layout()
     
     # Save
-    filename = 'precipitation_temporal_trends.png'
+    filename = f'precipitation_temporal_trends_{mask_type}.png'
     plt.savefig(output_dir / filename, dpi=300, bbox_inches='tight')
     plt.close()
     
     print(f"Saved: {filename}")
 
-def plot_regional_compound_analysis(events_data, output_dir):
+def plot_regional_compound_analysis(events_data, output_dir, mask_type='both'):
     """Analyze compound events by region."""
     output_dir = Path(output_dir)
     
@@ -476,7 +680,7 @@ def plot_regional_compound_analysis(events_data, output_dir):
         
         ax1.barh(compound_counts.index, compound_counts.values, color=colors, alpha=0.7)
         ax1.set_xlabel('Number of Events')
-        ax1.set_title('Compound Event Frequency by Type', fontweight='bold')
+        ax1.set_title(f'Compound Event Frequency by Type ({mask_type.capitalize()})', fontweight='bold')
         ax1.grid(True, alpha=0.3)
     
     # 2. Precipitation pattern seasonality
@@ -501,7 +705,7 @@ def plot_regional_compound_analysis(events_data, output_dir):
             
             ax2.set_xlabel('Month')
             ax2.set_ylabel('Number of Events')
-            ax2.set_title('Seasonal Distribution of Precipitation Patterns', fontweight='bold')
+            ax2.set_title(f'Seasonal Distribution of Precipitation Patterns ({mask_type.capitalize()})', fontweight='bold')
             ax2.set_xticks(months)
             ax2.set_xticklabels(month_labels)
             ax2.legend()
@@ -516,13 +720,17 @@ def plot_regional_compound_analysis(events_data, output_dir):
             
             subset = events_data[events_data['compound_event_type'] == event_type]
             if len(subset) > 0:
-                color = COMPOUND_COLORS.get(event_type, 'gray')
-                ax3.scatter(subset['duration_days'], subset['during_hw_total_precip'], 
-                           alpha=0.6, label=event_type, color=color, s=20)
+                # Remove NaN values for plotting
+                mask_valid = subset['during_hw_total_precip'].notna() & subset['duration_days'].notna()
+                if mask_valid.any():
+                    color = COMPOUND_COLORS.get(event_type, 'gray')
+                    ax3.scatter(subset.loc[mask_valid, 'duration_days'], 
+                               subset.loc[mask_valid, 'during_hw_total_precip'], 
+                               alpha=0.6, label=event_type, color=color, s=20)
         
         ax3.set_xlabel('Duration (days)')
         ax3.set_ylabel('During-Heatwave Precipitation (mm)')
-        ax3.set_title('Duration vs Precipitation by Event Type', fontweight='bold')
+        ax3.set_title(f'Duration vs Precipitation by Event Type ({mask_type.capitalize()})', fontweight='bold')
         ax3.legend()
         ax3.grid(True, alpha=0.3)
     
@@ -572,14 +780,14 @@ def plot_regional_compound_analysis(events_data, output_dir):
     
     ax4.set_title('Compound Event Statistics', fontweight='bold', pad=20)
     
-    plt.suptitle(f'Regional Compound Event Analysis\n'
+    plt.suptitle(f'Regional Compound Event Analysis ({mask_type.capitalize()})\n'
                 f'Total Events: {len(events_data):,}',
                 fontsize=16, fontweight='bold', y=0.95)
     
     plt.tight_layout()
     
     # Save
-    filename = 'regional_compound_analysis.png'
+    filename = f'regional_compound_analysis_{mask_type}.png'
     plt.savefig(output_dir / filename, dpi=300, bbox_inches='tight')
     plt.close()
     
@@ -595,6 +803,8 @@ def main():
                        help='Output directory for plots')
     parser.add_argument('--years', nargs='+', type=int,
                        help='Specific years to analyze (default: all available)')
+    parser.add_argument('--mask-type', choices=['land', 'ocean', 'both'], default='both',
+                       help='Analysis domain: land-only, ocean-only, or both (default: both)')
     
     args = parser.parse_args()
     
@@ -603,6 +813,7 @@ def main():
     print("="*80)
     print(f"Input directory: {args.precip_dir}")
     print(f"Output directory: {args.output_dir}")
+    print(f"Analysis domain: {args.mask_type}")
     print("="*80)
     
     # Create output directory
@@ -624,27 +835,27 @@ def main():
         # 1. Compound event patterns
         if aggregation_data and len(aggregation_data.data_vars) > 0:
             print("1. Compound event patterns...")
-            plot_compound_event_patterns(aggregation_data, output_dir)
+            plot_compound_event_patterns(aggregation_data, output_dir, args.mask_type)
         
         # 2. Recovery analysis
         if aggregation_data and len(aggregation_data.data_vars) > 0:
             print("2. Precipitation recovery analysis...")
-            plot_precipitation_recovery_analysis(aggregation_data, output_dir)
+            plot_precipitation_recovery_analysis(aggregation_data, output_dir, args.mask_type)
         
         # 3. Event-level analysis
         if not events_data.empty:
             print("3. Event-level precipitation analysis...")
-            plot_event_precipitation_analysis(events_data, output_dir)
+            plot_event_precipitation_analysis(events_data, output_dir, args.mask_type)
         
         # 4. Temporal trends
         if aggregation_data and 'year' in aggregation_data.dims:
             print("4. Temporal trends...")
-            plot_temporal_precipitation_trends(aggregation_data, events_data, output_dir)
+            plot_temporal_precipitation_trends(aggregation_data, events_data, output_dir, args.mask_type)
         
         # 5. Regional analysis
         if not events_data.empty:
             print("5. Regional compound analysis...")
-            plot_regional_compound_analysis(events_data, output_dir)
+            plot_regional_compound_analysis(events_data, output_dir, args.mask_type)
         
         print("\n" + "="*80)
         print("PRECIPITATION ANALYSIS VISUALIZATION COMPLETED!")

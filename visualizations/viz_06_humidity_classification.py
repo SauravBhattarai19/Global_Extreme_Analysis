@@ -28,11 +28,159 @@ import pandas as pd
 import seaborn as sns
 from datetime import datetime
 import warnings
+try:
+    import regionmask
+    HAS_REGIONMASK = True
+except ImportError:
+    HAS_REGIONMASK = False
+    print("Note: regionmask not available - using simplified land/ocean mask")
 warnings.filterwarnings('ignore')
 
 # Set style
 plt.style.use('seaborn-v0_8-whitegrid')
 sns.set_palette("husl")
+
+def create_land_ocean_mask(ds, mask_type='both'):
+    """
+    Create accurate land/ocean mask using regionmask (if available) or cartopy.
+    
+    Args:
+        ds: xarray Dataset with latitude/longitude coordinates
+        mask_type: 'land', 'ocean', or 'both'
+    
+    Returns:
+        mask: Boolean array where True = include pixel, False = exclude
+    """
+    if mask_type == 'both':
+        return np.ones((len(ds.latitude), len(ds.longitude)), dtype=bool)
+    
+    lat = ds.latitude.values
+    lon = ds.longitude.values
+    
+    print(f"Creating {mask_type} mask...")
+    print(f"  Grid: {len(lat)} x {len(lon)} pixels")
+    
+    if HAS_REGIONMASK:
+        try:
+            # Use regionmask with Natural Earth land boundaries
+            print("  Using regionmask with Natural Earth boundaries...")
+            
+            # Create a dummy dataset with coordinates named as regionmask expects
+            dummy_ds = xr.Dataset(coords={'lat': lat, 'lon': lon})
+            
+            # Get Natural Earth land boundaries
+            land_mask_rm = regionmask.defined_regions.natural_earth_v5_0_0.land_110.mask(dummy_ds)
+            
+            # Convert to boolean (regionmask returns integers)
+            land_mask = ~np.isnan(land_mask_rm.values)
+            
+            print(f"  Land pixels: {np.sum(land_mask):,} ({np.sum(land_mask)/land_mask.size*100:.1f}%)")
+            print(f"  Ocean pixels: {np.sum(~land_mask):,} ({np.sum(~land_mask)/land_mask.size*100:.1f}%)")
+            
+            if mask_type == 'land':
+                return land_mask
+            elif mask_type == 'ocean':
+                return ~land_mask
+            else:
+                return np.ones_like(land_mask, dtype=bool)
+                
+        except Exception as e:
+            print(f"  regionmask failed: {e}")
+            print("  Falling back to cartopy...")
+    
+    # Fallback: Use cartopy's built-in land feature
+    print("  Using cartopy Natural Earth features...")
+    
+    try:
+        # Use cartopy's natural earth land feature
+        import cartopy.io.shapereader as shpreader
+        
+        # Get land geometries
+        land_shp = shpreader.natural_earth(resolution='50m', category='physical', name='land')
+        land_geoms = list(shpreader.Reader(land_shp).geometries())
+        
+        # Create mask efficiently
+        land_mask = np.zeros((len(lat), len(lon)), dtype=bool)
+        
+        # Create coordinate meshgrid
+        lon_grid, lat_grid = np.meshgrid(lon, lat)
+        
+        # Vectorized point-in-polygon test (more efficient)
+        from shapely.geometry import Point
+        from shapely.prepared import prep
+        
+        # Prepare geometries for faster intersection
+        prepared_geoms = [prep(geom) for geom in land_geoms]
+        
+        # Check each point
+        for i in range(len(lat)):
+            for j in range(len(lon)):
+                point = Point(lon[j], lat[i])
+                for prep_geom in prepared_geoms:
+                    if prep_geom.contains(point):
+                        land_mask[i, j] = True
+                        break
+        
+        print(f"  Land pixels: {np.sum(land_mask):,} ({np.sum(land_mask)/land_mask.size*100:.1f}%)")
+        print(f"  Ocean pixels: {np.sum(~land_mask):,} ({np.sum(~land_mask)/land_mask.size*100:.1f}%)")
+        
+        if mask_type == 'land':
+            return land_mask
+        elif mask_type == 'ocean':
+            return ~land_mask
+        else:
+            return np.ones_like(land_mask, dtype=bool)
+            
+    except Exception as e:
+        print(f"  Error creating land mask: {e}")
+        print("  Using simplified approximation...")
+        
+        # Last resort: very simplified land/ocean approximation
+        lat_grid, lon_grid = np.meshgrid(lat, lon, indexing='ij')
+        
+        # Very basic land approximation (major continents only)
+        land_mask = np.zeros_like(lat_grid, dtype=bool)
+        
+        # Continents (very rough)
+        land_mask |= (lat_grid >= -60) & (lat_grid <= 75) & (lon_grid >= -170) & (lon_grid <= -30)  # Americas
+        land_mask |= (lat_grid >= -35) & (lat_grid <= 75) & (lon_grid >= -20) & (lon_grid <= 180)   # Eurasia+Africa
+        land_mask |= (lat_grid >= -50) & (lat_grid <= -10) & (lon_grid >= 110) & (lon_grid <= 180)  # Australia
+        
+        if mask_type == 'land':
+            return land_mask
+        elif mask_type == 'ocean':
+            return ~land_mask
+        else:
+            return np.ones_like(land_mask, dtype=bool)
+
+def apply_mask_and_adjust_colorbar(data, mask, percentile_range=(0.5, 99.5)):
+    """
+    Apply mask to data and calculate appropriate colorbar range.
+    
+    Args:
+        data: numpy array of data values
+        mask: boolean mask (True = include)
+        percentile_range: tuple of (low, high) percentiles for colorbar
+    
+    Returns:
+        masked_data: data with mask applied (NaN where mask is False)
+        vmin, vmax: colorbar range values
+        valid_count: number of valid pixels
+    """
+    # Apply mask
+    masked_data = data.copy()
+    masked_data[~mask] = np.nan
+    
+    # Calculate colorbar range from masked data
+    valid_data = masked_data[~np.isnan(masked_data)]
+    
+    if len(valid_data) == 0:
+        return masked_data, 0, 1, 0
+    
+    vmin = np.percentile(valid_data, percentile_range[0])
+    vmax = np.percentile(valid_data, percentile_range[1])
+    
+    return masked_data, vmin, vmax, len(valid_data)
 
 # Humidity category colors
 HUMIDITY_COLORS = {
@@ -96,9 +244,12 @@ def load_humidity_data(humidity_dir, years=None, variables=['tmax', 'tmin']):
     
     return combined_events, combined_days, aggregation_data
 
-def plot_global_humidity_patterns(aggregation_data, output_dir, variables=['tmax', 'tmin']):
+def plot_global_humidity_patterns(aggregation_data, output_dir, mask_type='both', variables=['tmax', 'tmin']):
     """Create global maps of humidity-classified heatwave patterns."""
     output_dir = Path(output_dir)
+    
+    # Create land/ocean mask
+    mask = create_land_ocean_mask(aggregation_data, mask_type)
     
     for var in variables:
         # Check which humidity variables are available
@@ -126,15 +277,21 @@ def plot_global_humidity_patterns(aggregation_data, output_dir, variables=['tmax
         ax1.add_feature(cfeature.BORDERS, linewidth=0.3)
         ax1.set_global()
         
-        levels = np.arange(0, 6, 0.5)
+        # Apply mask and calculate levels
+        humid_masked, humid_vmin, humid_vmax, humid_count = apply_mask_and_adjust_colorbar(
+            humid_mean.values, mask, percentile_range=(0.5, 99.5)
+        )
+        
+        levels = np.linspace(humid_vmin, humid_vmax, 20)
         cmap = plt.cm.Blues
         
-        im1 = ax1.contourf(humid_mean.longitude, humid_mean.latitude, humid_mean,
+        im1 = ax1.contourf(humid_mean.longitude, humid_mean.latitude, humid_masked,
                           levels=levels, cmap=cmap, transform=ccrs.PlateCarree(),
                           extend='max')
         
-        ax1.set_title(f'Humid Heatwave Frequency ({var.upper()})\n'
-                     f'Period: {aggregation_data.year.min().values}-{aggregation_data.year.max().values}',
+        ax1.set_title(f'Humid Heatwave Frequency ({var.upper()}, {mask_type.capitalize()})\n'
+                     f'Period: {aggregation_data.year.min().values}-{aggregation_data.year.max().values}\n'
+                     f'({humid_count:,} valid pixels)',
                      fontsize=12, fontweight='bold')
         
         cbar1 = plt.colorbar(im1, ax=ax1, shrink=0.8)
@@ -146,13 +303,21 @@ def plot_global_humidity_patterns(aggregation_data, output_dir, variables=['tmax
         ax2.add_feature(cfeature.BORDERS, linewidth=0.3)
         ax2.set_global()
         
+        # Apply mask to dry data
+        dry_masked, dry_vmin, dry_vmax, dry_count = apply_mask_and_adjust_colorbar(
+            dry_mean.values, mask, percentile_range=(0.5, 99.5)
+        )
+        
+        levels_dry = np.linspace(dry_vmin, dry_vmax, 20)
         cmap2 = plt.cm.Oranges
         
-        im2 = ax2.contourf(dry_mean.longitude, dry_mean.latitude, dry_mean,
-                          levels=levels, cmap=cmap2, transform=ccrs.PlateCarree(),
+        im2 = ax2.contourf(dry_mean.longitude, dry_mean.latitude, dry_masked,
+                          levels=levels_dry, cmap=cmap2, transform=ccrs.PlateCarree(),
                           extend='max')
         
-        ax2.set_title(f'Dry Heatwave Frequency ({var.upper()})', fontsize=12, fontweight='bold')
+        ax2.set_title(f'Dry Heatwave Frequency ({var.upper()}, {mask_type.capitalize()})\n'
+                     f'({dry_count:,} valid pixels)', 
+                     fontsize=12, fontweight='bold')
         
         cbar2 = plt.colorbar(im2, ax=ax2, shrink=0.8)
         cbar2.set_label('Events per year', fontsize=10)
@@ -164,20 +329,30 @@ def plot_global_humidity_patterns(aggregation_data, output_dir, variables=['tmax
         ax3.set_global()
         
         # Calculate dominant type (where total events > 0.5/year)
-        significant_mask = total_events > 0.5
+        total_masked, _, _, _ = apply_mask_and_adjust_colorbar(
+            total_events.values, mask, percentile_range=(0.5, 99.5)
+        )
+        significant_mask = (total_masked > 0.5) & (~np.isnan(total_masked))
         
         # Create dominant type array
-        dominant_type = np.full_like(humid_mean.values, 0, dtype=int)
+        dominant_type = np.zeros_like(humid_mean.values, dtype=int)
+        
+        # Apply masking first
+        humid_masked_dom = humid_mean.values.copy()
+        dry_masked_dom = dry_mean.values.copy()
+        mixed_masked_dom = mixed_mean.values.copy()
+        humid_masked_dom[~mask] = np.nan
+        dry_masked_dom[~mask] = np.nan
+        mixed_masked_dom[~mask] = np.nan
         
         # Where significant heatwave activity exists
-        mask = significant_mask.values
-        humid_dom = (humid_mean >= dry_mean) & (humid_mean >= mixed_mean) & significant_mask
-        dry_dom = (dry_mean >= humid_mean) & (dry_mean >= mixed_mean) & significant_mask
-        mixed_dom = (mixed_mean >= humid_mean) & (mixed_mean >= dry_mean) & significant_mask
+        humid_dom = (humid_masked_dom >= dry_masked_dom) & (humid_masked_dom >= mixed_masked_dom) & significant_mask
+        dry_dom = (dry_masked_dom >= humid_masked_dom) & (dry_masked_dom >= mixed_masked_dom) & significant_mask
+        mixed_dom = (mixed_masked_dom >= humid_masked_dom) & (mixed_masked_dom >= dry_masked_dom) & significant_mask
         
-        dominant_type[humid_dom.values] = 1  # Humid
-        dominant_type[dry_dom.values] = 2    # Dry
-        dominant_type[mixed_dom.values] = 3  # Mixed
+        dominant_type[humid_dom] = 1  # Humid
+        dominant_type[dry_dom] = 2    # Dry
+        dominant_type[mixed_dom] = 3  # Mixed
         
         # Create custom colormap
         colors = ['white', HUMIDITY_COLORS['humid-hot'], HUMIDITY_COLORS['dry-hot'], 
@@ -189,7 +364,8 @@ def plot_global_humidity_patterns(aggregation_data, output_dir, variables=['tmax
                                aggregation_data.latitude.min(), aggregation_data.latitude.max()],
                         transform=ccrs.PlateCarree())
         
-        ax3.set_title(f'Dominant Heatwave Type ({var.upper()})', fontsize=12, fontweight='bold')
+        ax3.set_title(f'Dominant Heatwave Type ({var.upper()}, {mask_type.capitalize()})', 
+                     fontsize=12, fontweight='bold')
         
         cbar3 = plt.colorbar(im3, ax=ax3, shrink=0.8, ticks=[1, 2, 3])
         cbar3.set_ticklabels(['Humid', 'Dry', 'Mixed'])
@@ -200,36 +376,43 @@ def plot_global_humidity_patterns(aggregation_data, output_dir, variables=['tmax
         ax4.add_feature(cfeature.BORDERS, linewidth=0.3)
         ax4.set_global()
         
-        # Calculate humidity ratio
-        humidity_ratio = humid_mean / (humid_mean + dry_mean + 0.1)  # Add small value to avoid division by zero
+        # Calculate humidity ratio with masking
+        ratio_denominator = humid_mean + dry_mean + 0.1  # Add small value to avoid division by zero
+        humidity_ratio = humid_mean / ratio_denominator
+        
+        # Apply mask to ratio data
+        ratio_masked, ratio_vmin, ratio_vmax, ratio_count = apply_mask_and_adjust_colorbar(
+            humidity_ratio.values, mask, percentile_range=(0.5, 99.5)
+        )
         
         levels_ratio = np.linspace(0, 1, 11)
         cmap4 = plt.cm.RdYlBu
         
-        im4 = ax4.contourf(humidity_ratio.longitude, humidity_ratio.latitude, humidity_ratio,
+        im4 = ax4.contourf(humidity_ratio.longitude, humidity_ratio.latitude, ratio_masked,
                           levels=levels_ratio, cmap=cmap4, transform=ccrs.PlateCarree(),
                           extend='both')
         
-        ax4.set_title(f'Humidity Ratio ({var.upper()})\nHumid / (Humid + Dry)', 
+        ax4.set_title(f'Humidity Ratio ({var.upper()}, {mask_type.capitalize()})\nHumid / (Humid + Dry)\n'
+                     f'({ratio_count:,} valid pixels)', 
                      fontsize=12, fontweight='bold')
         
         cbar4 = plt.colorbar(im4, ax=ax4, shrink=0.8)
         cbar4.set_label('Ratio (0=Dry, 1=Humid)', fontsize=10)
         
-        plt.suptitle(f'Heatwave Humidity Patterns - {var.upper()}\n'
+        plt.suptitle(f'Heatwave Humidity Patterns - {var.upper()} ({mask_type.capitalize()})\n'
                     f'Period: {aggregation_data.year.min().values}-{aggregation_data.year.max().values}',
                     fontsize=16, fontweight='bold', y=0.95)
         
         plt.tight_layout()
         
         # Save
-        filename = f'humidity_patterns_{var}.png'
+        filename = f'humidity_patterns_{var}_{mask_type}.png'
         plt.savefig(output_dir / filename, dpi=300, bbox_inches='tight')
         plt.close()
         
         print(f"Saved: {filename}")
 
-def plot_humidity_event_analysis(events_data, output_dir):
+def plot_humidity_event_analysis(events_data, output_dir, mask_type='both'):
     """Analyze humidity characteristics of individual events."""
     output_dir = Path(output_dir)
     
@@ -257,7 +440,7 @@ def plot_humidity_event_analysis(events_data, output_dir):
         
         wedges, texts, autotexts = ax1.pie(label_counts.values, labels=label_counts.index, 
                                           colors=colors, autopct='%1.1f%%', startangle=90)
-        ax1.set_title('Heatwave Humidity Category Distribution', fontweight='bold')
+        ax1.set_title(f'Heatwave Humidity Category Distribution ({mask_type.capitalize()})', fontweight='bold')
     
     # 2. Humidity vs Duration
     ax2 = axes[0, 1]
@@ -267,12 +450,13 @@ def plot_humidity_event_analysis(events_data, output_dir):
             if label in events_data['label_day'].values:
                 subset = events_data[events_data['label_day'] == label]
                 durations = subset['duration_days']
-                ax2.hist(durations, bins=range(1, 21), alpha=0.7, label=label, 
-                        color=HUMIDITY_COLORS[label], density=True)
+                if len(durations) > 0:
+                    ax2.hist(durations, bins=range(1, 21), alpha=0.7, label=label, 
+                            color=HUMIDITY_COLORS[label], density=True)
         
         ax2.set_xlabel('Duration (days)')
         ax2.set_ylabel('Density')
-        ax2.set_title('Duration by Humidity Category', fontweight='bold')
+        ax2.set_title(f'Duration by Humidity Category ({mask_type.capitalize()})', fontweight='bold')
         ax2.legend()
         ax2.grid(True, alpha=0.3)
     
@@ -289,15 +473,16 @@ def plot_humidity_event_analysis(events_data, output_dir):
         for label in ['dry-hot', 'humid-hot', 'mixed-hot']:
             if label in events_data['label_day'].values:
                 subset = events_data[events_data['label_day'] == label]
-                monthly_counts = subset['start_month'].value_counts().sort_index()
-                counts = [monthly_counts.get(m, 0) for m in months]
-                
-                ax3.plot(months, counts, 'o-', color=HUMIDITY_COLORS[label], 
-                        label=label, linewidth=2, markersize=6)
+                if len(subset) > 0:
+                    monthly_counts = subset['start_month'].value_counts().sort_index()
+                    counts = [monthly_counts.get(m, 0) for m in months]
+                    
+                    ax3.plot(months, counts, 'o-', color=HUMIDITY_COLORS[label], 
+                            label=label, linewidth=2, markersize=6)
         
         ax3.set_xlabel('Month')
         ax3.set_ylabel('Number of Events')
-        ax3.set_title('Seasonal Humidity Patterns', fontweight='bold')
+        ax3.set_title(f'Seasonal Humidity Patterns ({mask_type.capitalize()})', fontweight='bold')
         ax3.set_xticks(months)
         ax3.set_xticklabels(month_labels)
         ax3.legend()
@@ -353,26 +538,29 @@ def plot_humidity_event_analysis(events_data, output_dir):
     
     ax4.set_title('Humidity Category Statistics', fontweight='bold', pad=20)
     
-    plt.suptitle(f'Heatwave Humidity Event Analysis\n'
+    plt.suptitle(f'Heatwave Humidity Event Analysis ({mask_type.capitalize()})\n'
                 f'Total Events: {len(events_data):,}',
                 fontsize=16, fontweight='bold', y=0.95)
     
     plt.tight_layout()
     
     # Save
-    filename = 'humidity_event_analysis.png'
+    filename = f'humidity_event_analysis_{mask_type}.png'
     plt.savefig(output_dir / filename, dpi=300, bbox_inches='tight')
     plt.close()
     
     print(f"Saved: {filename}")
 
-def plot_humidity_trends(aggregation_data, output_dir, variables=['tmax', 'tmin']):
+def plot_humidity_trends(aggregation_data, output_dir, mask_type='both', variables=['tmax', 'tmin']):
     """Plot temporal trends in humidity-classified heatwaves."""
     output_dir = Path(output_dir)
     
     if 'year' not in aggregation_data.dims or len(aggregation_data.year) < 3:
         print("Insufficient years for trend analysis")
         return
+    
+    # Create land/ocean mask
+    mask = create_land_ocean_mask(aggregation_data, mask_type)
     
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     
@@ -388,10 +576,32 @@ def plot_humidity_trends(aggregation_data, output_dir, variables=['tmax', 'tmin'
         if humid_var not in aggregation_data.data_vars:
             continue
         
-        # Calculate global means
-        humid_global = aggregation_data[humid_var].mean(dim=['latitude', 'longitude'])
-        dry_global = aggregation_data[dry_var].mean(dim=['latitude', 'longitude'])
-        mixed_global = aggregation_data[mixed_var].mean(dim=['latitude', 'longitude'])
+        # Calculate global means with masking
+        humid_global = []
+        dry_global = []
+        mixed_global = []
+        
+        for year in years:
+            # Apply mask to each year's data
+            humid_year = aggregation_data[humid_var].sel(year=year).values
+            dry_year = aggregation_data[dry_var].sel(year=year).values
+            mixed_year = aggregation_data[mixed_var].sel(year=year).values
+            
+            humid_masked = humid_year.copy()
+            dry_masked = dry_year.copy()
+            mixed_masked = mixed_year.copy()
+            
+            humid_masked[~mask] = np.nan
+            dry_masked[~mask] = np.nan
+            mixed_masked[~mask] = np.nan
+            
+            humid_global.append(np.nanmean(humid_masked))
+            dry_global.append(np.nanmean(dry_masked))
+            mixed_global.append(np.nanmean(mixed_masked))
+        
+        humid_global = np.array(humid_global)
+        dry_global = np.array(dry_global)
+        mixed_global = np.array(mixed_global)
         total_global = humid_global + dry_global + mixed_global
         
         # Plot absolute trends
@@ -405,8 +615,8 @@ def plot_humidity_trends(aggregation_data, output_dir, variables=['tmax', 'tmin'
                 label='Mixed', linewidth=2, markersize=6)
         
         ax1.set_xlabel('Year')
-        ax1.set_ylabel('Global Mean Events/Year')
-        ax1.set_title(f'Humidity Category Trends ({var.upper()})', fontweight='bold')
+        ax1.set_ylabel('Mean Events/Year')
+        ax1.set_title(f'Humidity Category Trends ({var.upper()}, {mask_type.capitalize()})', fontweight='bold')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
         
@@ -426,25 +636,25 @@ def plot_humidity_trends(aggregation_data, output_dir, variables=['tmax', 'tmin'
         
         ax2.set_xlabel('Year')
         ax2.set_ylabel('Percentage of Total Events (%)')
-        ax2.set_title(f'Humidity Category Percentages ({var.upper()})', fontweight='bold')
+        ax2.set_title(f'Humidity Category Percentages ({var.upper()}, {mask_type.capitalize()})', fontweight='bold')
         ax2.legend()
         ax2.grid(True, alpha=0.3)
         ax2.set_ylim(0, 100)
     
-    plt.suptitle(f'Humidity-Classified Heatwave Trends\n'
+    plt.suptitle(f'Humidity-Classified Heatwave Trends ({mask_type.capitalize()})\n'
                 f'Period: {years[0]}-{years[-1]}',
                 fontsize=16, fontweight='bold', y=0.95)
     
     plt.tight_layout()
     
     # Save
-    filename = 'humidity_trends.png'
+    filename = f'humidity_trends_{mask_type}.png'
     plt.savefig(output_dir / filename, dpi=300, bbox_inches='tight')
     plt.close()
     
     print(f"Saved: {filename}")
 
-def plot_regional_humidity_comparison(events_data, output_dir):
+def plot_regional_humidity_comparison(events_data, output_dir, mask_type='both'):
     """Compare humidity patterns across different regions."""
     output_dir = Path(output_dir)
     
@@ -461,13 +671,7 @@ def plot_regional_humidity_comparison(events_data, output_dir):
         'Southern Mid-Latitudes': {'lat_range': (-60, -40), 'color': 'purple'}
     }
     
-    # Assuming grid_y corresponds to latitude index (need to convert)
-    # This is a simplification - in practice, you'd need the actual lat/lon coordinates
-    
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    
-    # For this example, we'll use a simplified regional analysis
-    # based on grid_y values (assuming they correlate with latitude)
     
     # 1. Humidity distribution by variable
     ax1 = axes[0, 0]
@@ -481,7 +685,7 @@ def plot_regional_humidity_comparison(events_data, output_dir):
                              color=[HUMIDITY_COLORS.get(col, 'gray') for col in var_humidity.columns])
             ax1.set_xlabel('Variable')
             ax1.set_ylabel('Number of Events')
-            ax1.set_title('Humidity Distribution by Variable', fontweight='bold')
+            ax1.set_title(f'Humidity Distribution by Variable ({mask_type.capitalize()})', fontweight='bold')
             ax1.legend(title='Humidity Type')
             plt.setp(ax1.get_xticklabels(), rotation=0)
     
@@ -511,7 +715,7 @@ def plot_regional_humidity_comparison(events_data, output_dir):
             
             ax2.set_xlabel('Month')
             ax2.set_ylabel('Percentage (%)')
-            ax2.set_title('Seasonal Humidity Distribution', fontweight='bold')
+            ax2.set_title(f'Seasonal Humidity Distribution ({mask_type.capitalize()})', fontweight='bold')
             ax2.set_xticks(months)
             ax2.set_xticklabels(month_labels)
             ax2.legend()
@@ -528,7 +732,7 @@ def plot_regional_humidity_comparison(events_data, output_dir):
         
         ax3.set_xlabel('Duration (days)')
         ax3.set_ylabel('Mean RH (%)')
-        ax3.set_title('Duration vs Humidity Intensity', fontweight='bold')
+        ax3.set_title(f'Duration vs Humidity Intensity ({mask_type.capitalize()})', fontweight='bold')
         ax3.legend()
         ax3.grid(True, alpha=0.3)
     
@@ -547,28 +751,28 @@ def plot_regional_humidity_comparison(events_data, output_dir):
             
             ax4.set_xlabel('Year')
             ax4.set_ylabel('Number of Events')
-            ax4.set_title('Annual Humidity Trends', fontweight='bold')
+            ax4.set_title(f'Annual Humidity Trends ({mask_type.capitalize()})', fontweight='bold')
             ax4.legend()
             ax4.grid(True, alpha=0.3)
         else:
             ax4.text(0.5, 0.5, 'Insufficient years\nfor trend analysis', 
                     ha='center', va='center', transform=ax4.transAxes, fontsize=14)
-            ax4.set_title('Annual Humidity Analysis', fontweight='bold')
+            ax4.set_title(f'Annual Humidity Analysis ({mask_type.capitalize()})', fontweight='bold')
     
-    plt.suptitle(f'Regional Humidity Analysis\n'
+    plt.suptitle(f'Regional Humidity Analysis ({mask_type.capitalize()})\n'
                 f'Total Events: {len(events_data):,}',
                 fontsize=16, fontweight='bold', y=0.95)
     
     plt.tight_layout()
     
     # Save
-    filename = 'humidity_regional_analysis.png'
+    filename = f'humidity_regional_analysis_{mask_type}.png'
     plt.savefig(output_dir / filename, dpi=300, bbox_inches='tight')
     plt.close()
     
     print(f"Saved: {filename}")
 
-def plot_humidity_day_analysis(days_data, output_dir):
+def plot_humidity_day_analysis(days_data, output_dir, mask_type='both'):
     """Analyze day-level humidity classifications."""
     output_dir = Path(output_dir)
     
@@ -597,7 +801,7 @@ def plot_humidity_day_analysis(days_data, output_dir):
         ax1.bar(class_counts.index, class_counts.values, color=colors, alpha=0.7)
         ax1.set_xlabel('Humidity Class')
         ax1.set_ylabel('Number of Days')
-        ax1.set_title('Daily Humidity Classification Distribution', fontweight='bold')
+        ax1.set_title(f'Daily Humidity Classification Distribution ({mask_type.capitalize()})', fontweight='bold')
         plt.setp(ax1.get_xticklabels(), rotation=45, ha='right')
         ax1.grid(True, alpha=0.3)
     
@@ -614,7 +818,7 @@ def plot_humidity_day_analysis(days_data, output_dir):
     
     ax2.set_xlabel('Relative Humidity (%)')
     ax2.set_ylabel('Density')
-    ax2.set_title('RH Value Distributions', fontweight='bold')
+    ax2.set_title(f'RH Value Distributions ({mask_type.capitalize()})', fontweight='bold')
     ax2.legend()
     ax2.grid(True, alpha=0.3)
     
@@ -630,12 +834,12 @@ def plot_humidity_day_analysis(days_data, output_dir):
         rh_vals = days_data['RH_day'].values
         
         # Remove NaN values
-        mask = ~(np.isnan(temps) | np.isnan(rh_vals))
-        if np.sum(mask) > 0:
-            ax3.scatter(temps[mask], rh_vals[mask], alpha=0.5, s=1, c='blue')
+        mask_temp_rh = ~(np.isnan(temps) | np.isnan(rh_vals))
+        if np.sum(mask_temp_rh) > 0:
+            ax3.scatter(temps[mask_temp_rh], rh_vals[mask_temp_rh], alpha=0.5, s=1, c='blue')
             ax3.set_xlabel('Temperature (°C)')
             ax3.set_ylabel('Relative Humidity (%)')
-            ax3.set_title('Temperature vs RH Relationship', fontweight='bold')
+            ax3.set_title(f'Temperature vs RH Relationship ({mask_type.capitalize()})', fontweight='bold')
             ax3.grid(True, alpha=0.3)
     
     # 4. Temporal patterns
@@ -668,19 +872,19 @@ def plot_humidity_day_analysis(days_data, output_dir):
             
             ax4.set_xlabel('Month')
             ax4.set_ylabel('Percentage (%)')
-            ax4.set_title('Monthly Humidity Classification', fontweight='bold')
+            ax4.set_title(f'Monthly Humidity Classification ({mask_type.capitalize()})', fontweight='bold')
             ax4.set_xticks(months)
             ax4.set_xticklabels(month_labels)
             ax4.legend()
     
-    plt.suptitle(f'Day-Level Humidity Analysis\n'
+    plt.suptitle(f'Day-Level Humidity Analysis ({mask_type.capitalize()})\n'
                 f'Total Days: {len(days_data):,}',
                 fontsize=16, fontweight='bold', y=0.95)
     
     plt.tight_layout()
     
     # Save
-    filename = 'humidity_day_analysis.png'
+    filename = f'humidity_day_analysis_{mask_type}.png'
     plt.savefig(output_dir / filename, dpi=300, bbox_inches='tight')
     plt.close()
     
@@ -698,6 +902,8 @@ def main():
                        help='Specific years to analyze (default: all available)')
     parser.add_argument('--variables', nargs='+', default=['tmax', 'tmin'],
                        help='Variables to analyze (default: tmax tmin)')
+    parser.add_argument('--mask-type', choices=['land', 'ocean', 'both'], default='both',
+                       help='Analysis domain: land-only, ocean-only, or both (default: both)')
     
     args = parser.parse_args()
     
@@ -707,6 +913,7 @@ def main():
     print(f"Input directory: {args.humidity_dir}")
     print(f"Output directory: {args.output_dir}")
     print(f"Variables: {args.variables}")
+    print(f"Analysis domain: {args.mask_type}")
     print("="*80)
     
     # Create output directory
@@ -728,27 +935,27 @@ def main():
         # 1. Global humidity patterns
         if aggregation_data and len(aggregation_data.data_vars) > 0:
             print("1. Global humidity patterns...")
-            plot_global_humidity_patterns(aggregation_data, output_dir, args.variables)
+            plot_global_humidity_patterns(aggregation_data, output_dir, args.mask_type, args.variables)
         
         # 2. Event-level analysis
         if not events_data.empty:
             print("2. Event-level humidity analysis...")
-            plot_humidity_event_analysis(events_data, output_dir)
+            plot_humidity_event_analysis(events_data, output_dir, args.mask_type)
         
         # 3. Temporal trends
         if aggregation_data and 'year' in aggregation_data.dims:
             print("3. Humidity trends...")
-            plot_humidity_trends(aggregation_data, output_dir, args.variables)
+            plot_humidity_trends(aggregation_data, output_dir, args.mask_type, args.variables)
         
         # 4. Regional comparison
         if not events_data.empty:
             print("4. Regional humidity comparison...")
-            plot_regional_humidity_comparison(events_data, output_dir)
+            plot_regional_humidity_comparison(events_data, output_dir, args.mask_type)
         
         # 5. Day-level analysis
         if not days_data.empty:
             print("5. Day-level humidity analysis...")
-            plot_humidity_day_analysis(days_data, output_dir)
+            plot_humidity_day_analysis(days_data, output_dir, args.mask_type)
         
         print("\n" + "="*80)
         print("HUMIDITY CLASSIFICATION VISUALIZATION COMPLETED!")
