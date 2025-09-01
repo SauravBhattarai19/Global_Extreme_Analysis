@@ -1,19 +1,73 @@
-#!/usr/bin/env python3
+def save_mask_debug_figure(ds, mask, mask_type, output_dir):
+    """
+    Create a debug figure showing the land/ocean mask.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(15, 9), subplot_kw={'projection': ccrs.PlateCarree()})
+    
+    # Original data (show a sample variable to see data coverage)
+    ax1 = axes[0]
+    ax1.add_feature(cfeature.COASTLINE, linewidth=0.5)
+    ax1.add_feature(cfeature.BORDERS, linewidth=0.3)
+    ax1.set_global()
+    ax1.set_title('Data Coverage Example', fontsize=14, fontweight='bold')
+    
+    # Show where we have valid data (use first available variable)
+    for var_name in ['PRCPTOT', 'R95p', 'R95pTOT']:
+        if var_name in ds.data_vars:
+            sample_data = ds[var_name].isel(year=0).values
+            valid_data = ~np.isnan(sample_data)
+            im1 = ax1.contourf(ds.longitude, ds.latitude, valid_data.astype(int),
+                              levels=[0.5, 1.5], colors=['lightblue'], alpha=0.7,
+                              transform=ccrs.PlateCarree())
+            ax1.text(0.02, 0.98, f'Valid {var_name} pixels', transform=ax1.transAxes,
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8),
+                    verticalalignment='top')
+            break
+    
+    # Applied mask
+    ax2 = axes[1]
+    ax2.add_feature(cfeature.COASTLINE, linewidth=0.5)
+    ax2.add_feature(cfeature.BORDERS, linewidth=0.3)
+    ax2.set_global()
+    ax2.set_title(f'Applied {mask_type.title()} Mask', fontsize=14, fontweight='bold')
+    
+    # Show the mask
+    mask_colors = ['white', 'darkgreen'] if mask_type == 'land' else ['darkblue', 'white']
+    im2 = ax2.contourf(ds.longitude, ds.latitude, mask.astype(int),
+                      levels=[0.5, 1.5], colors=[mask_colors[1]], alpha=0.8,
+                      transform=ccrs.PlateCarree())
+    
+    mask_pct = np.sum(mask) / mask.size * 100
+    ax2.text(0.02, 0.98, f'{mask_type.title()} pixels: {np.sum(mask):,} ({mask_pct:.1f}%)',
+            transform=ax2.transAxes,
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8),
+            verticalalignment='top')
+    
+    plt.tight_layout()
+    
+    # Save debug figure
+    debug_filename = f'mask_debug_{mask_type}.png'
+    debug_path = output_dir / debug_filename
+    plt.savefig(debug_path, dpi=200, bbox_inches='tight', facecolor='white')
+    plt.close()
+    
+    print(f"Mask debug figure saved: {debug_path}")
+    return debug_path#!/usr/bin/env python3
 """
-Create Publication Figure: Trends in WDXXR Chronological Precipitation Indices
+Optimized Create Publication Figure: Trends in Precipitation Indices (ETCCDI)
 
 High-performance version with:
-- Vectorized Mann-Kendall trend analysis for multiple percentiles
+- Vectorized Mann-Kendall trend analysis
 - Multiprocessing for 192-core systems
 - Permanent data storage (no caching)
 - Scientific-grade statistical testing
 
 Figure Layout: 4 rows × 3 columns
-- Rows: WD25R, WD50R, WD75R, WD90R (chronological precipitation clustering)
+- Rows: PRCPTOT, R95p, R95pTOT, WD50
 - Columns: 1980-2024, 1980-1999 (pre-2000), 2000-2024 (post-2000)
 
 Usage:
-python figure4.py --wd50r-dir data/processed/wd50r_indices --output-dir figures/
+python optimized_precipitation_trends.py --etccdi-dir data/processed/etccdi_indices --output-dir figures/
 """
 
 import sys
@@ -29,10 +83,11 @@ import pandas as pd
 from scipy import stats
 import warnings
 import multiprocessing as mp
-from multiprocessing import Pool
+from multiprocessing import Pool, shared_memory
 import time
 from functools import partial
 import h5py
+import json
 from numba import jit, prange
 import os
 
@@ -48,8 +103,6 @@ warnings.filterwarnings('ignore')
 # Set publication style
 plt.rcParams.update({
     'font.size': 12,
-    'font.family': 'serif',
-    'font.serif': ['Times New Roman'],
     'axes.linewidth': 0.8,
     'axes.labelsize': 12,
     'axes.titlesize': 13,
@@ -65,7 +118,15 @@ plt.rcParams.update({
 def mann_kendall_vectorized(data_3d, years):
     """
     Vectorized Mann-Kendall trend test using Numba for speed.
-    (Same implementation as figure2.py)
+    
+    Args:
+        data_3d: 3D array (time, lat, lon)
+        years: 1D array of years
+    
+    Returns:
+        slopes: 2D array of Sen's slopes (per year)
+        p_values: 2D array of p-values
+        z_stats: 2D array of Z-statistics
     """
     nt, nlat, nlon = data_3d.shape
     slopes = np.full((nlat, nlon), np.nan)
@@ -120,7 +181,7 @@ def mann_kendall_vectorized(data_3d, years):
                 slopes_array = np.array(slopes_list)
                 slopes[i, j] = np.median(slopes_array)
             
-            # Variance of S (assuming no ties for simplicity)
+            # Variance of S (assuming no ties for simplicity - can be enhanced)
             var_s = n * (n - 1) * (2 * n + 5) / 18.0
             
             # Z-statistic
@@ -144,7 +205,7 @@ def mann_kendall_vectorized(data_3d, years):
 def enhanced_mann_kendall_with_ties(data, years):
     """
     Enhanced Mann-Kendall test accounting for ties in data.
-    (Same implementation as figure2.py)
+    Uses scipy for accurate p-value calculation.
     """
     from scipy import stats as scipy_stats
     
@@ -220,7 +281,17 @@ def process_pixel_chunk(args):
 def calculate_trends_parallel(data_array, years, n_processes=None, chunk_size=50):
     """
     Calculate Mann-Kendall trends using multiprocessing.
-    (Same implementation as figure2.py)
+    
+    Args:
+        data_array: xarray DataArray with time dimension
+        years: array of years
+        n_processes: number of processes (default: min(192, available cores))
+        chunk_size: size of spatial chunks
+    
+    Returns:
+        slopes: trend slopes (per year)
+        p_values: p-values from Mann-Kendall test
+        z_stats: Z-statistics
     """
     if n_processes is None:
         n_processes = min(192, mp.cpu_count())
@@ -264,7 +335,6 @@ def calculate_trends_parallel(data_array, years, n_processes=None, chunk_size=50
 def create_optimized_land_ocean_mask(ds, mask_type='both', validate=True):
     """
     Optimized land/ocean mask creation with validation.
-    (Same implementation as figure2.py)
     """
     if mask_type == 'both':
         return np.ones((len(ds.latitude), len(ds.longitude)), dtype=bool)
@@ -279,6 +349,7 @@ def create_optimized_land_ocean_mask(ds, mask_type='both', validate=True):
             # Use regionmask with proper coordinate handling
             dummy_ds = xr.Dataset(coords={'lat': lat, 'lon': lon})
             
+            # Use higher resolution mask for better accuracy
             try:
                 land_mask_rm = regionmask.defined_regions.natural_earth_v5_0_0.land_50.mask(dummy_ds)
                 print("  Using 50m resolution Natural Earth boundaries")
@@ -288,48 +359,92 @@ def create_optimized_land_ocean_mask(ds, mask_type='both', validate=True):
             
             land_mask = ~np.isnan(land_mask_rm.values)
             
-            # Clean up mask
+            # Clean up mask - remove isolated pixels
             from scipy.ndimage import binary_opening, binary_closing
             if land_mask.sum() > 0:
+                # Remove small isolated ocean pixels in land areas
                 land_mask = binary_closing(land_mask, iterations=1)
+                # Remove small isolated land pixels in ocean areas  
                 land_mask = binary_opening(land_mask, iterations=1)
             
             if validate:
                 land_pct = np.sum(land_mask) / land_mask.size * 100
+                ocean_pct = 100 - land_pct
                 print(f"  Land pixels: {np.sum(land_mask):,} ({land_pct:.1f}%)")
+                print(f"  Ocean pixels: {np.sum(~land_mask):,} ({ocean_pct:.1f}%)")
+                
+                # Validate reasonable land/ocean ratio
+                if land_pct < 25 or land_pct > 40:
+                    print(f"  Warning: Unusual land percentage ({land_pct:.1f}%) - check mask quality")
             
-            return land_mask if mask_type == 'land' else ~land_mask
+            final_mask = land_mask if mask_type == 'land' else ~land_mask
+            
+            if validate:
+                print(f"  Final {mask_type} mask: {np.sum(final_mask):,} pixels ({np.sum(final_mask)/final_mask.size*100:.1f}%)")
+            
+            return final_mask
             
         except Exception as e:
             print(f"  regionmask failed: {e}, using fallback")
     
-    # Enhanced fallback approach (same as figure2.py)
+    # Enhanced fallback approach with better boundaries
     print("  Using enhanced geometric land/ocean approximation...")
     lat_grid, lon_grid = np.meshgrid(lat, lon, indexing='ij')
     
     land_mask = np.zeros_like(lat_grid, dtype=bool)
     
+    # More precise continent boundaries
     land_regions = [
-        # North America
-        ((lat_grid >= 25) & (lat_grid <= 75) & (lon_grid >= -170) & (lon_grid <= -50)),
-        # South America  
-        ((lat_grid >= -60) & (lat_grid <= 15) & (lon_grid >= -85) & (lon_grid <= -30)),
-        # Europe
-        ((lat_grid >= 35) & (lat_grid <= 75) & (lon_grid >= -15) & (lon_grid <= 45)),
-        # Asia
-        ((lat_grid >= 5) & (lat_grid <= 75) & (lon_grid >= 25) & (lon_grid <= 180)),
-        # Africa
-        ((lat_grid >= -35) & (lat_grid <= 40) & (lon_grid >= -20) & (lon_grid <= 55)),
-        # Australia
+        # North America (more precise)
+        ((lat_grid >= 25) & (lat_grid <= 75) & (lon_grid >= -170) & (lon_grid <= -50) & 
+         ~((lat_grid >= 25) & (lat_grid <= 35) & (lon_grid >= -100) & (lon_grid <= -80))),  # Remove Gulf of Mexico
+        
+        # South America
+        ((lat_grid >= -60) & (lat_grid <= 15) & (lon_grid >= -85) & (lon_grid <= -30) &
+         ~((lat_grid >= -20) & (lat_grid <= 10) & (lon_grid >= -50) & (lon_grid <= -35))),  # Remove Atlantic coast
+        
+        # Europe (more precise)
+        ((lat_grid >= 35) & (lat_grid <= 75) & (lon_grid >= -15) & (lon_grid <= 45) &
+         ~((lat_grid >= 35) & (lat_grid <= 50) & (lon_grid >= -15) & (lon_grid <= 5))),   # Remove Atlantic
+        
+        # Asia (more precise)
+        ((lat_grid >= 5) & (lat_grid <= 75) & (lon_grid >= 25) & (lon_grid <= 180) &
+         ~((lat_grid >= 5) & (lat_grid <= 25) & (lon_grid >= 50) & (lon_grid <= 75))),    # Remove Arabian Sea
+        
+        # Africa (more precise)
+        ((lat_grid >= -35) & (lat_grid <= 40) & (lon_grid >= -20) & (lon_grid <= 55) &
+         ~((lat_grid >= -10) & (lat_grid <= 20) & (lon_grid >= 30) & (lon_grid <= 50))),  # Remove Red Sea/Indian Ocean
+        
+        # Australia and Oceania
         ((lat_grid >= -50) & (lat_grid <= -5) & (lon_grid >= 110) & (lon_grid <= 180)),
+        
         # Greenland
         ((lat_grid >= 60) & (lat_grid <= 85) & (lon_grid >= -75) & (lon_grid <= -10)),
-        # Antarctica
+        
+        # Antarctica  
         (lat_grid <= -60),
     ]
     
+    # Combine all land regions
     for region in land_regions:
         land_mask |= region
+    
+    # Remove major water bodies more precisely
+    water_bodies = [
+        # Mediterranean Sea
+        ((lat_grid >= 30) & (lat_grid <= 50) & (lon_grid >= -10) & (lon_grid <= 40)),
+        # Black Sea
+        ((lat_grid >= 40) & (lat_grid <= 50) & (lon_grid >= 25) & (lon_grid <= 45)),
+        # Caspian Sea
+        ((lat_grid >= 35) & (lat_grid <= 50) & (lon_grid >= 45) & (lon_grid <= 55)),
+        # Great Lakes region (approximate)
+        ((lat_grid >= 40) & (lat_grid <= 50) & (lon_grid >= -95) & (lon_grid <= -75)),
+        # Hudson Bay
+        ((lat_grid >= 50) & (lat_grid <= 65) & (lon_grid >= -100) & (lon_grid <= -75)),
+    ]
+    
+    for water_body in water_bodies:
+        land_mask &= ~water_body
     
     if validate:
         land_pct = np.sum(land_mask) / land_mask.size * 100
@@ -337,162 +452,165 @@ def create_optimized_land_ocean_mask(ds, mask_type='both', validate=True):
     
     return land_mask if mask_type == 'land' else ~land_mask
 
-def load_wdxxr_data_optimized(wd50r_dir, percentiles=[25, 50, 75, 90], years=None):
+def load_etccdi_data_optimized(etccdi_dir, years=None):
     """
-    Load WDXXR data for multiple percentiles from chronological precipitation indices.
+    Optimized ETCCDI data loading with memory-efficient operations.
     """
-    wd50r_dir = Path(wd50r_dir)
+    etccdi_dir = Path(etccdi_dir)
     
-    print(f"Loading WDXXR data from: {wd50r_dir.absolute()}")
-    print(f"Target percentiles: {percentiles}")
+    print(f"Searching for ETCCDI files in: {etccdi_dir.absolute()}")
     
     if years is None:
-        # Find WD50R files (assuming they contain all percentiles)
-        wd50r_files = list(wd50r_dir.glob('wd50r_indices_*.nc'))
+        # Check if directory exists
+        if not etccdi_dir.exists():
+            raise FileNotFoundError(f"Directory does not exist: {etccdi_dir}")
         
-        if not wd50r_files:
-            raise FileNotFoundError(f"No WDXXR files found in {wd50r_dir}")
+        # Look for ETCCDI files with various possible patterns
+        patterns = [
+            'etccdi_precipitation_indices_*.nc',
+            'etccdi_*.nc', 
+            '*precipitation*indices*.nc',
+            '*etccdi*.nc',
+            '*.nc'  # fallback to show all .nc files
+        ]
         
-        print(f"Found {len(wd50r_files)} WDXXR files")
+        etccdi_files = []
+        all_nc_files = []
         
-        # Extract years
-        years = []
-        for f in wd50r_files:
-            name_parts = f.stem.split('_')
-            for part in name_parts:
-                if part.isdigit() and len(part) == 4 and 1900 <= int(part) <= 2030:
-                    years.append(int(part))
-                    break
+        for pattern in patterns:
+            files = list(etccdi_dir.glob(pattern))
+            all_nc_files.extend([f for f in files if f not in all_nc_files])
+            if pattern == 'etccdi_precipitation_indices_*.nc' and files:
+                etccdi_files = files
+                break
+            elif pattern == 'etccdi_*.nc' and files and not etccdi_files:
+                etccdi_files = files
+            elif pattern == '*precipitation*indices*.nc' and files and not etccdi_files:
+                etccdi_files = files
+            elif pattern == '*etccdi*.nc' and files and not etccdi_files:
+                etccdi_files = files
         
-        years = sorted(set(years))
-        print(f"Years: {years[0]}-{years[-1]} ({len(years)} years)")
-    
-    # Load WDXXR data for all percentiles
-    wdxxr_datasets = {}
-    
-    for percentile in percentiles:
-        print(f"\nLoading WD{percentile}R data...")
-        wdxxr_data_list = []
-        valid_years = []
+        print(f"Found {len(all_nc_files)} .nc files total:")
+        for f in sorted(all_nc_files)[:10]:  # Show first 10
+            print(f"  {f.name}")
+        if len(all_nc_files) > 10:
+            print(f"  ... and {len(all_nc_files) - 10} more")
         
-        for year in years:
-            # Find file for this year
-            year_files = list(wd50r_dir.glob(f'wd50r_indices_{year}_*.nc'))
-            
-            if year_files:
-                file_path = year_files[0]  # Take first match
+        if not etccdi_files:
+            raise FileNotFoundError(
+                f"No ETCCDI precipitation index files found in {etccdi_dir}\n"
+                f"Expected pattern: 'etccdi_precipitation_indices_YYYY.nc'\n"
+                f"Please check your file naming convention or directory path."
+            )
+        
+        print(f"Using {len(etccdi_files)} ETCCDI files:")
+        for f in sorted(etccdi_files)[:5]:  # Show first 5
+            print(f"  {f.name}")
+        if len(etccdi_files) > 5:
+            print(f"  ... and {len(etccdi_files) - 5} more")
+        
+        # Extract years from filenames
+        try:
+            years = []
+            for f in etccdi_files:
+                # Try different filename patterns to extract year
+                name_parts = f.stem.split('_')
+                year_found = False
                 
-                try:
-                    with xr.open_dataset(file_path) as ds:
-                        var_name = f'WD{percentile}R'
-                        
-                        if var_name in ds.data_vars:
-                            wd_var = ds[var_name]
-                            
-                            # Debug info for first file
-                            if len(valid_years) == 0:
-                                print(f"  WD{percentile}R dtype: {wd_var.dtype}")
-                                sample_vals = wd_var.values.flatten()
-                                valid_sample = sample_vals[~np.isnan(sample_vals)][:5]
-                                print(f"  Sample values: {valid_sample}")
-                            
-                            # Handle timedelta conversion (same logic as figure3.py)
-                            if 'timedelta' in str(wd_var.dtype):
-                                #print(f"  Converting WD{percentile}R from timedelta to days")
-                                wd_values = wd_var / np.timedelta64(1, 'D')
-                                wd_values = wd_values.astype(np.float64)
-                            elif 'datetime' in str(wd_var.dtype):
-                                #print(f"  Converting WD{percentile}R from datetime to days")
-                                wd_values = wd_var.astype(np.float64)
-                            else:
-                                # Check for suspiciously large values
-                                sample_vals = wd_var.values.flatten()
-                                valid_sample = sample_vals[~np.isnan(sample_vals)]
-                                
-                                if len(valid_sample) > 0 and np.mean(valid_sample) > 1e10:
-                                    print(f"  Detected nanoseconds, converting WD{percentile}R to days")
-                                    wd_values = wd_var / 1e9 / 86400  # ns -> days
-                                    wd_values = wd_values.astype(np.float64)
-                                elif len(valid_sample) > 0 and np.mean(valid_sample) > 1e6:
-                                    print(f"  Detected microseconds, converting WD{percentile}R to days")
-                                    wd_values = wd_var / 1e6 / 86400  # μs -> days
-                                    wd_values = wd_values.astype(np.float64)
-                                else:
-                                    wd_values = wd_var.astype(np.float64)
-                            
-                            # Debug converted values for first file
-                            if len(valid_years) == 0:
-                                conv_sample = wd_values.values.flatten()
-                                valid_conv = conv_sample[~np.isnan(conv_sample)][:5]
-                                print(f"  Converted sample values: {valid_conv}")
-                            
-                            wdxxr_data_list.append(wd_values.values)
-                            valid_years.append(year)
-                            
-                            # Get coordinates from first file
-                            if len(valid_years) == 1:
-                                lat_coords = ds.latitude.values
-                                lon_coords = ds.longitude.values
-                                
-                        else:
-                            print(f"  Warning: WD{percentile}R not found in {file_path}")
-                            
-                except Exception as e:
-                    print(f"  Error loading {file_path}: {e}")
+                # Look for 4-digit years in filename parts
+                for part in name_parts:
+                    if part.isdigit() and len(part) == 4 and 1900 <= int(part) <= 2030:
+                        years.append(int(part))
+                        year_found = True
+                        break
+                
+                if not year_found:
+                    print(f"Warning: Could not extract year from {f.name}")
+            
+            if not years:
+                raise ValueError("Could not extract years from any filenames")
+                
+            years = sorted(set(years))
+            print(f"Extracted years: {years[0]}-{years[-1]} ({len(years)} years)")
+            
+        except (ValueError, IndexError) as e:
+            raise ValueError(f"Could not extract years from filenames: {e}")
+    
+    print(f"Loading ETCCDI data for {len(years)} years...")
+    
+    # Load first file to get dimensions and variables
+    first_file = etccdi_dir / f'etccdi_precipitation_indices_{years[0]}.nc'
+    with xr.open_dataset(first_file) as ds_first:
+        variables = list(ds_first.data_vars)
+        lat_coords = ds_first.latitude.values
+        lon_coords = ds_first.longitude.values
+    
+    print(f"Variables: {variables}")
+    print(f"Grid: {len(lat_coords)} x {len(lon_coords)}")
+    
+    # Pre-allocate arrays for efficient loading
+    data_arrays = {}
+    for var in ['PRCPTOT', 'R95p', 'R95pTOT']:
+        if var in variables:
+            data_arrays[var] = np.full((len(years), len(lat_coords), len(lon_coords)), np.nan)
+    
+    # Load data year by year
+    valid_years = []
+    for i, year in enumerate(years):
+        file_path = etccdi_dir / f'etccdi_precipitation_indices_{year}.nc'
         
-        if not wdxxr_data_list:
-            print(f"  Warning: No valid WD{percentile}R data found, skipping")
-            continue
-        
-        # Combine into dataset for this percentile
-        wdxxr_array = np.stack(wdxxr_data_list, axis=0)
-        
-        coords = {
-            'year': valid_years,
-            'latitude': lat_coords,
-            'longitude': lon_coords
-        }
-        
-        wdxxr_da = xr.DataArray(
-            wdxxr_array,
+        if file_path.exists():
+            try:
+                with xr.open_dataset(file_path) as ds:
+                    # Process timedelta variables
+                    timedelta_vars = ['WD50', 'wet_days', 'very_wet_days']
+                    for var in timedelta_vars:
+                        if var in ds.data_vars and 'timedelta' in str(ds[var].dtype):
+                            ds[var] = ds[var] / np.timedelta64(1, 'D')
+                            ds[var] = ds[var].astype(np.float64)
+                    
+                    # Store data in pre-allocated arrays
+                    for var in data_arrays.keys():
+                        if var in ds.data_vars:
+                            data_arrays[var][i] = ds[var].values
+                
+                valid_years.append(year)
+            except Exception as e:
+                print(f"  Error loading {file_path}: {e}")
+    
+    # Create optimized xarray dataset
+    coords = {
+        'year': valid_years,
+        'latitude': lat_coords,
+        'longitude': lon_coords
+    }
+    
+    data_vars = {}
+    for var, data in data_arrays.items():
+        # Only keep years that loaded successfully
+        data_vars[var] = xr.DataArray(
+            data[:len(valid_years)],
             dims=['year', 'latitude', 'longitude'],
-            coords=coords,
-            name=f'WD{percentile}R'
+            coords=coords
         )
-        
-        wdxxr_datasets[f'WD{percentile}R'] = wdxxr_da
-        
-        # Validation
-        sample_data = wdxxr_da.values.flatten()
-        valid_final = sample_data[~np.isnan(sample_data)]
-        
-        if len(valid_final) > 0:
-            print(f"  Successfully loaded WD{percentile}R: {len(valid_years)} years, {wdxxr_array.shape[1]}x{wdxxr_array.shape[2]} grid")
-            print(f"  Data range: {np.min(valid_final):.2f} to {np.max(valid_final):.2f} days")
-            print(f"  Data mean: {np.mean(valid_final):.2f} ± {np.std(valid_final):.2f} days")
     
-    if not wdxxr_datasets:
-        raise ValueError("No valid WDXXR data found for any percentile")
+    combined_ds = xr.Dataset(data_vars, coords=coords)
     
-    # Combine all percentiles into single dataset
-    combined_ds = xr.Dataset(wdxxr_datasets, coords=coords)
-    
-    print(f"\nSuccessfully loaded {len(wdxxr_datasets)} WDXXR variables")
+    print(f"Successfully loaded: {len(valid_years)} years, {len(data_vars)} variables")
     return combined_ds
 
-def save_wdxxr_trends_permanent(trends_data, data_info, output_dir, mask_type):
+def save_trends_permanent(trends_data, data_info, output_dir, mask_type):
     """
-    Save WDXXR trends data to permanent HDF5 format.
+    Save trends data to permanent HDF5 format for repeated use.
     """
-    # Create unique filename
+    # Create unique filename based on data characteristics
     years_str = f"{data_info['years'][0]}-{data_info['years'][-1]}"
     shape_str = f"{data_info['shape'][0]}x{data_info['shape'][1]}"
-    percentiles_str = '_'.join(map(str, data_info['percentiles']))
-    filename = f"wdxxr_trends_{years_str}_{shape_str}_P{percentiles_str}_{mask_type}.h5"
+    filename = f"trends_permanent_{years_str}_{shape_str}_{mask_type}.h5"
     
     trends_file = output_dir / filename
     
-    print(f"Saving permanent WDXXR trends data to: {trends_file}")
+    print(f"Saving permanent trends data to: {trends_file}")
     
     with h5py.File(trends_file, 'w') as f:
         # Save metadata
@@ -504,17 +622,22 @@ def save_wdxxr_trends_permanent(trends_data, data_info, output_dir, mask_type):
         metadata_grp.attrs['lat_range'] = data_info['lat_range']
         metadata_grp.attrs['lon_range'] = data_info['lon_range']
         metadata_grp.create_dataset('years', data=np.array(data_info['years']))
+        # Handle NumPy 2.0 compatibility for string arrays
+        try:
+            # NumPy < 2.0
+            variables_data = np.array(data_info['variables'], dtype='S')
+        except:
+            # NumPy >= 2.0 or other issues - use bytes encoding
+            variables_data = np.array([var.encode('utf-8') for var in data_info['variables']], dtype='S')
         
-        # Save percentiles
-        percentiles_data = np.array([str(p) for p in data_info['percentiles']], dtype='S')
-        metadata_grp.create_dataset('percentiles', data=percentiles_data)
+        metadata_grp.create_dataset('variables', data=variables_data)
         
         # Save periods metadata
         periods_grp = metadata_grp.create_group('periods')
         for period_name, period_years in data_info['periods'].items():
             periods_grp.attrs[period_name] = period_years
         
-        # Save trends data for each percentile and period
+        # Save trends data for each variable and period
         for var_name, var_data in trends_data.items():
             var_grp = f.create_group(var_name)
             
@@ -522,13 +645,13 @@ def save_wdxxr_trends_permanent(trends_data, data_info, output_dir, mask_type):
                 period_grp = var_grp.create_group(period_name)
                 
                 # Save arrays with compression
-                period_grp.create_dataset('slopes', data=period_data['slopes'],
+                period_grp.create_dataset('slopes', data=period_data['slopes'], 
                                         compression='gzip', compression_opts=9)
-                period_grp.create_dataset('p_values', data=period_data['p_values'],
+                period_grp.create_dataset('p_values', data=period_data['p_values'], 
                                         compression='gzip', compression_opts=9)
-                period_grp.create_dataset('z_stats', data=period_data['z_stats'],
+                period_grp.create_dataset('z_stats', data=period_data['z_stats'], 
                                         compression='gzip', compression_opts=9)
-                period_grp.create_dataset('significant', data=period_data['significant'],
+                period_grp.create_dataset('significant', data=period_data['significant'], 
                                         compression='gzip', compression_opts=9)
                 period_grp.create_dataset('years', data=period_data['years'])
                 
@@ -537,17 +660,18 @@ def save_wdxxr_trends_permanent(trends_data, data_info, output_dir, mask_type):
                 period_grp.attrs['significant_pixels'] = np.sum(period_data['significant'])
                 period_grp.attrs['total_pixels'] = period_data['significant'].size
     
-    print(f"WDXXR trends data permanently saved: {trends_file.stat().st_size / (1024**3):.2f} GB")
+    print(f"Trends data permanently saved: {trends_file.stat().st_size / (1024**3):.2f} GB")
     return trends_file
 
-def load_wdxxr_trends_permanent(output_dir, mask_type=None, filename=None):
+def load_trends_permanent(output_dir, mask_type=None, filename=None):
     """
-    Load permanent WDXXR trends data from HDF5 format.
+    Load permanent trends data from HDF5 format.
     """
     if filename:
         trends_file = Path(filename)
     else:
-        pattern = f"wdxxr_trends_*_{mask_type}.h5" if mask_type else "wdxxr_trends_*.h5"
+        # Find most recent trends file for this mask type
+        pattern = f"trends_permanent_*_{mask_type}.h5" if mask_type else "trends_permanent_*.h5"
         trends_files = list(output_dir.glob(pattern))
         
         if not trends_files:
@@ -558,7 +682,7 @@ def load_wdxxr_trends_permanent(output_dir, mask_type=None, filename=None):
     if not trends_file.exists():
         return None
     
-    print(f"Loading permanent WDXXR trends data from: {trends_file}")
+    print(f"Loading permanent trends data from: {trends_file}")
     
     trends_data = {}
     
@@ -566,22 +690,45 @@ def load_wdxxr_trends_permanent(output_dir, mask_type=None, filename=None):
         # Load metadata
         metadata = dict(f['metadata'].attrs)
         
-        # Load percentiles
+        # Handle variables with robust loading
         try:
-            percentiles_data = f['metadata/percentiles'][:]
-            percentiles = [int(s.decode('utf-8')) for s in percentiles_data]
-        except:
-            # Fallback: scan for percentile variables
-            possible_percentiles = [25, 50, 75, 90]
-            percentiles = [p for p in possible_percentiles if f'WD{p}R' in f]
+            # Try to load variables dataset first
+            if 'variables' in f['metadata']:
+                variables_data = f['metadata/variables'][:]
+                # Handle different data types
+                if hasattr(variables_data[0], 'decode'):
+                    variables = [s.decode('utf-8') for s in variables_data]
+                else:
+                    variables = [str(s) for s in variables_data]
+            else:
+                raise KeyError("Variables dataset not found")
+                
+        except (KeyError, TypeError) as e:
+            print(f"  Variables dataset not found, trying attributes fallback: {e}")
+            # Fallback: load from attributes
+            variables = []
+            if 'n_variables' in metadata:
+                n_vars = metadata['n_variables']
+                for i in range(n_vars):
+                    var_key = f'variable_{i}'
+                    if var_key in metadata:
+                        variables.append(str(metadata[var_key]))
+            
+            if not variables:
+                # Last resort: scan for variable groups
+                print("  Scanning HDF5 groups for variables...")
+                possible_vars = ['PRCPTOT', 'R95p', 'R95pTOT', 'WD50']
+                variables = [var for var in possible_vars if var in f]
+                
+        if not variables:
+            raise ValueError("Could not determine variables from HDF5 file")
         
-        print(f"  Percentiles: {percentiles}")
+        print(f"  Variables: {variables}")
         print(f"  Years: {metadata['years_range']}")
         print(f"  Grid: {metadata['grid_shape']}")
         
         # Load trends data
-        for percentile in percentiles:
-            var_name = f'WD{percentile}R'
+        for var_name in variables:
             if var_name not in f:
                 continue
                 
@@ -603,19 +750,15 @@ def load_wdxxr_trends_permanent(output_dir, mask_type=None, filename=None):
 
 def add_significance_contours(ax, ds, significant, mask, line_width=0.8, alpha=0.9):
     """
-    Add significance contours with proper masking.
+    Optimized significance visualization using contours.
     """
     significant_masked = significant & mask
     if not np.any(significant_masked):
         return
     
     try:
-        # Apply mask more aggressively - set non-mask areas to 0
-        sig_for_contour = np.zeros_like(significant_masked, dtype=float)
-        sig_for_contour[significant_masked] = 1.0
-        sig_for_contour[~mask] = 0.0  # Explicitly set non-mask to 0
-        
-        contours = ax.contour(ds.longitude, ds.latitude, sig_for_contour,
+        sig_float = significant_masked.astype(float)
+        contours = ax.contour(ds.longitude, ds.latitude, sig_float,
                             levels=[0.5], colors='black', linewidths=line_width,
                             transform=ccrs.PlateCarree(), alpha=alpha)
         return contours
@@ -623,85 +766,56 @@ def add_significance_contours(ax, ds, significant, mask, line_width=0.8, alpha=0
         print(f"Warning: Could not draw significance contours: {e}")
         return None
 
-def save_mask_debug_figure(ds, mask, mask_type, output_dir):
+def add_significance_boundaries(ax, ds, significant, mask, line_width=0.5, alpha=0.7):
     """
-    Create a debug figure showing the land/ocean mask application.
+    Add significance boundaries using optimized edge detection.
     """
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6), subplot_kw={'projection': ccrs.PlateCarree()})
+    from scipy.ndimage import binary_dilation, binary_erosion
     
-    # Original data coverage
-    ax1 = axes[0]
-    ax1.add_feature(cfeature.COASTLINE, linewidth=0.5)
-    ax1.add_feature(cfeature.BORDERS, linewidth=0.3)
-    ax1.set_global()
-    ax1.set_title('Data Coverage Example', fontsize=14, fontweight='bold')
+    significant_masked = significant & mask
+    if not np.any(significant_masked):
+        return
     
-    # Show where we have valid data (use first available variable)
-    available_vars = [var for var in ds.data_vars if 'WD' in var and 'R' in var]
-    if available_vars:
-        sample_data = ds[available_vars[0]].isel(year=0).values
-        valid_data = ~np.isnan(sample_data)
-        im1 = ax1.contourf(ds.longitude, ds.latitude, valid_data.astype(int),
-                          levels=[0.5, 1.5], colors=['lightblue'], alpha=0.7,
-                          transform=ccrs.PlateCarree())
-        ax1.text(0.02, 0.98, f'Valid {available_vars[0]} pixels', transform=ax1.transAxes,
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8),
-                verticalalignment='top')
-    
-    # Applied mask
-    ax2 = axes[1]
-    ax2.add_feature(cfeature.COASTLINE, linewidth=0.5)
-    ax2.add_feature(cfeature.BORDERS, linewidth=0.3)
-    ax2.set_global()
-    ax2.set_title(f'Applied {mask_type.title()} Mask', fontsize=14, fontweight='bold')
-    
-    # Show the mask
-    mask_colors = ['white', 'darkgreen'] if mask_type == 'land' else ['darkblue', 'white']
-    im2 = ax2.contourf(ds.longitude, ds.latitude, mask.astype(int),
-                      levels=[0.5, 1.5], colors=[mask_colors[1]], alpha=0.8,
-                      transform=ccrs.PlateCarree())
-    
-    mask_pct = np.sum(mask) / mask.size * 100
-    ax2.text(0.02, 0.98, f'{mask_type.title()} pixels: {np.sum(mask):,} ({mask_pct:.1f}%)',
-            transform=ax2.transAxes,
-            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8),
-            verticalalignment='top')
-    
-    plt.tight_layout()
-    
-    # Save debug figure
-    debug_filename = f'wdxxr_mask_debug_{mask_type}.png'
-    debug_path = output_dir / debug_filename
-    plt.savefig(debug_path, dpi=200, bbox_inches='tight', facecolor='white')
-    plt.close()
-    
-    print(f"Mask debug figure saved: {debug_path}")
-    return debug_path
+    try:
+        # Find boundaries using morphological operations
+        sig_binary = significant_masked.astype(bool)
+        dilated = binary_dilation(sig_binary, iterations=1)
+        boundaries = dilated & ~sig_binary
+        
+        # Get boundary coordinates with subsampling for performance
+        boundary_coords = np.where(boundaries)
+        if len(boundary_coords[0]) > 0:
+            # Subsample for performance
+            n_points = len(boundary_coords[0])
+            skip = max(1, n_points // 1000)  # Max 1000 points
+            
+            boundary_lons = ds.longitude.values[boundary_coords[1]][::skip]
+            boundary_lats = ds.latitude.values[boundary_coords[0]][::skip]
+            
+            ax.scatter(boundary_lons, boundary_lats, s=line_width, c='black', 
+                      marker='.', alpha=alpha, transform=ccrs.PlateCarree())
+    except Exception as e:
+        print(f"Warning: Could not draw significance boundaries: {e}")
 
-def create_wdxxr_trends_figure(wdxxr_ds, trends_data, output_dir, mask_type='both',
-                              show_significance=True, significance_method='contour'):
+def create_optimized_precipitation_figure(etccdi_ds, trends_data, output_dir, mask_type='both', 
+                                        show_significance=True, significance_method='contour'):
     """
-    Create WDXXR trends figure (4 rows × 3 columns) with proper masking.
+    Create optimized precipitation trends figure.
     """
     # Create mask
-    mask = create_optimized_land_ocean_mask(wdxxr_ds, mask_type)
-    
-    # Validate mask
-    mask_pct = np.sum(mask) / mask.size * 100
-    print(f"Mask validation: {np.sum(mask):,} pixels ({mask_pct:.1f}%) for {mask_type} analysis")
+    mask = create_optimized_land_ocean_mask(etccdi_ds, mask_type)
     
     # Define indices and their properties
     indices_info = {
-        'WD25R': {'units': 'days/decade', 'title': 'WD25R', 'cmap': 'RdYlBu', 'symmetric': True},
-        'WD50R': {'units': 'days/decade', 'title': 'WD50R', 'cmap': 'RdYlBu', 'symmetric': True},
-        'WD75R': {'units': 'days/decade', 'title': 'WD75R', 'cmap': 'RdYlBu', 'symmetric': True},
-        'WD90R': {'units': 'days/decade', 'title': 'WD90R', 'cmap': 'RdYlBu', 'symmetric': True}
+        'PRCPTOT': {'units': 'mm/decade', 'title': 'PRCPTOT', 'cmap': 'BrBG', 'symmetric': True},
+        'R95p': {'units': 'mm/decade', 'title': 'R95p', 'cmap': 'BrBG', 'symmetric': True},
+        'R95pTOT': {'units': 'fraction/decade', 'title': 'R95pTOT', 'cmap': 'RdBu_r', 'symmetric': True}
     }
     
     periods = ['1980-2024', '1980-1999', '2000-2024']
     
     # Create figure
-    fig = plt.figure(figsize=(15, 16))  # Taller for 4 rows
+    fig = plt.figure(figsize=(15, 9))  # Reduced height since we have 3 rows instead of 4
     proj = ccrs.Robinson(central_longitude=0)
     
     subplot_idx = 0
@@ -713,32 +827,28 @@ def create_wdxxr_trends_figure(wdxxr_ds, trends_data, output_dir, mask_type='bot
         
         print(f"Creating plots for {index_name}...")
         
-        # Collect all trends for consistent colorbar - ONLY from masked pixels
+        # Collect all trends for consistent colorbar
         all_slopes = []
         for period_name in periods:
             if period_name in trends_data[index_name]:
                 slopes = trends_data[index_name][period_name]['slopes']
-                # Apply mask BEFORE collecting statistics
-                slopes_temp = slopes.copy()
-                slopes_temp[~mask] = np.nan
-                valid_slopes = slopes_temp[mask & ~np.isnan(slopes_temp)]
+                valid_slopes = slopes[mask & ~np.isnan(slopes)]
                 if len(valid_slopes) > 0:
                     all_slopes.extend(valid_slopes)
         
         if not all_slopes:
-            print(f"  Warning: No valid {index_name} trends found within {mask_type} mask")
             continue
         
         # Convert to per-decade
         all_slopes = np.array(all_slopes) * 10
         
-        # Determine colorbar range (symmetric for trends)
-        vmax_abs = np.percentile(np.abs(all_slopes), 98)
-        vmin, vmax = -vmax_abs, vmax_abs
-        
-        # Ensure non-zero range
-        if vmax_abs < 1e-10:
-            vmin, vmax = -1, 1
+        # Determine colorbar range
+        if index_info['symmetric']:
+            vmax_abs = np.percentile(np.abs(all_slopes), 98)
+            vmin, vmax = -vmax_abs, vmax_abs
+        else:
+            vmin = np.percentile(all_slopes, 2)
+            vmax = np.percentile(all_slopes, 98)
         
         levels = np.linspace(vmin, vmax, 21)
         
@@ -748,7 +858,7 @@ def create_wdxxr_trends_figure(wdxxr_ds, trends_data, output_dir, mask_type='bot
                 continue
             
             subplot_idx += 1
-            ax = plt.subplot(4, 3, subplot_idx, projection=proj)
+            ax = plt.subplot(3, 3, subplot_idx, projection=proj)
             
             # Map features
             ax.add_feature(cfeature.COASTLINE, linewidth=0.5, color='gray')
@@ -760,79 +870,22 @@ def create_wdxxr_trends_figure(wdxxr_ds, trends_data, output_dir, mask_type='bot
             slopes = period_data['slopes'] * 10  # Convert to per decade
             significant = period_data['significant']
             
-            # AGGRESSIVE MASKING - Multiple steps to prevent leakage
-            print(f"  Masking {index_name} {period_name}...")
-            
-            # Step 1: Start with NaN everywhere
-            slopes_masked = np.full_like(slopes, np.nan, dtype=np.float64)
-            
-            # Step 2: Only fill values where mask is True
-            slopes_masked[mask] = slopes[mask]
-            
-            # Step 3: Explicitly ensure no values outside mask
+            # Apply mask
+            slopes_masked = slopes.copy()
             slopes_masked[~mask] = np.nan
             
-            # Step 4: Additional buffer around mask boundaries to prevent interpolation
-            if mask_type in ['land', 'ocean']:
-                from scipy.ndimage import binary_erosion
-                # Erode mask slightly to create a buffer zone
-                mask_eroded = binary_erosion(mask, iterations=1)
-                slopes_masked[~mask_eroded] = np.nan
-                print(f"    Applied erosion buffer: {np.sum(mask_eroded)} pixels vs {np.sum(mask)} original")
-            
-            # Step 5: Final validation
-            valid_outside_mask = np.sum(~np.isnan(slopes_masked[~mask]))
-            valid_inside_mask = np.sum(~np.isnan(slopes_masked[mask]))
-            print(f"    Final check: {valid_inside_mask} valid inside mask, {valid_outside_mask} outside (should be 0)")
-            
-            if valid_outside_mask > 0:
-                print(f"    ERROR: Still {valid_outside_mask} values outside mask! Force-clearing...")
-                slopes_masked[~mask] = np.nan
-            
-            # Plot with multiple fallback methods
+            # Plot trends
             cmap = plt.cm.get_cmap(index_info['cmap'])
+            im = ax.contourf(etccdi_ds.longitude, etccdi_ds.latitude, slopes_masked,
+                           levels=levels, cmap=cmap, transform=ccrs.PlateCarree(),
+                           extend='both')
             
-            # Method 1: Try masked array with pcolormesh (most reliable for masking)
-            try:
-                slopes_ma = np.ma.masked_invalid(slopes_masked)
-                slopes_ma = np.ma.masked_where(~mask, slopes_ma)  # Double mask
-                
-                im = ax.pcolormesh(wdxxr_ds.longitude, wdxxr_ds.latitude, slopes_ma,
-                                 cmap=cmap, transform=ccrs.PlateCarree(),
-                                 vmin=vmin, vmax=vmax, shading='auto')
-                print(f"    Used pcolormesh for {index_name} {period_name}")
-                
-            except Exception as e1:
-                print(f"    pcolormesh failed: {e1}, trying contourf...")
-                
-                # Method 2: Try contourf with extended masking
-                try:
-                    # Create a version with extended NaN buffer for contourf
-                    slopes_for_contour = slopes_masked.copy()
-                    
-                    # Add extra NaN buffer around boundaries
-                    from scipy.ndimage import binary_dilation
-                    mask_dilated = binary_dilation(~mask, iterations=2)  # Dilate the ocean/land boundaries
-                    slopes_for_contour[mask_dilated] = np.nan
-                    
-                    im = ax.contourf(wdxxr_ds.longitude, wdxxr_ds.latitude, slopes_for_contour,
-                                   levels=levels, cmap=cmap, transform=ccrs.PlateCarree(),
-                                   extend='both')
-                    print(f"    Used contourf with buffer for {index_name} {period_name}")
-                    
-                except Exception as e2:
-                    print(f"    contourf also failed: {e2}, using imshow...")
-                    
-                    # Method 3: Last resort - imshow
-                    im = ax.imshow(slopes_masked, cmap=cmap, vmin=vmin, vmax=vmax,
-                                 extent=[wdxxr_ds.longitude.min(), wdxxr_ds.longitude.max(),
-                                        wdxxr_ds.latitude.min(), wdxxr_ds.latitude.max()],
-                                 transform=ccrs.PlateCarree(), aspect='auto')
-            
-            # Add significance with proper masking
-            if show_significance and np.any(significant & mask):
+            # Add significance
+            if show_significance:
                 if significance_method == 'contour':
-                    add_significance_contours(ax, wdxxr_ds, significant, mask)
+                    add_significance_contours(ax, etccdi_ds, significant, mask)
+                elif significance_method == 'boundary':
+                    add_significance_boundaries(ax, etccdi_ds, significant, mask)
             
             # Statistics - only count masked pixels
             valid_trends = slopes_masked[mask & ~np.isnan(slopes_masked)]
@@ -860,10 +913,6 @@ def create_wdxxr_trends_figure(wdxxr_ds, trends_data, output_dir, mask_type='bot
             else:
                 stats_text = ''
             
-            # Add total pixel count
-            if len(valid_trends) > 0:
-                stats_text += f'\n{len(valid_trends):,} pixels' if stats_text else f'{len(valid_trends):,} pixels'
-            
             # Title and labels
             if row_idx == 0:
                 ax.set_title(period_name, fontsize=14, fontweight='bold', pad=10)
@@ -889,22 +938,19 @@ def create_wdxxr_trends_figure(wdxxr_ds, trends_data, output_dir, mask_type='bot
             cbar.ax.tick_params(labelsize=11)
     
     # Main title
-    title_text = 'Trends in Chronological Precipitation Indices (WDXXR)\nMann-Kendall Analysis'
+    title_text = 'Trends in Precipitation Indices (Mann-Kendall Analysis)'
     if show_significance:
-        title_text += '\n(Contours indicate statistical significance, p < 0.10)'
+        sig_desc = 'contours' if significance_method == 'contour' else 'boundaries'
+        title_text += f'\n({sig_desc.capitalize()} indicate statistical significance, p < 0.10)'
     
-    # Add mask type to title
-    if mask_type != 'both':
-        title_text = f'{title_text}\n({mask_type.title()}-only analysis)'
-    
-    fig.suptitle(title_text, fontsize=18, fontweight='bold', y=0.96)
+    #fig.suptitle(title_text, fontsize=18, fontweight='bold', y=0.95)
     
     # Layout
     plt.subplots_adjust(left=0.1, right=0.85, top=0.90, bottom=0.05,
-                       wspace=0.05, hspace=0.15)
+                       wspace=0.05, hspace=-0.075)
     
     # Save
-    filename = f'wdxxr_trends_{mask_type}'
+    filename = f'precipitation_trends_optimized_{mask_type}'
     if show_significance:
         filename += f'_sig_{significance_method}'
     else:
@@ -919,50 +965,48 @@ def create_wdxxr_trends_figure(wdxxr_ds, trends_data, output_dir, mask_type='bot
     return output_path
 
 def main():
-    """Main function for WDXXR trends analysis."""
-    parser = argparse.ArgumentParser(description='WDXXR chronological precipitation trends analysis')
+    """Optimized main function."""
+    parser = argparse.ArgumentParser(description='Optimized precipitation trends analysis and visualization')
     
-    parser.add_argument('--wd50r-dir', default='data/processed/wd50r_indices',
-                       help='Directory containing WDXXR index files')
+    parser.add_argument('--etccdi-dir', default='data/processed/etccdi_indices',
+                       help='Directory containing ETCCDI index files')
     parser.add_argument('--output-dir', default='figures/',
                        help='Output directory for figures and data')
-    parser.add_argument('--percentiles', nargs='+', type=int, default=[25, 50, 75, 90],
-                       help='Percentiles to analyze (default: 25 50 75 90)')
     parser.add_argument('--mask-type', choices=['land', 'ocean', 'both'], default='both',
                        help='Analysis domain (default: both)')
     parser.add_argument('--no-significance', action='store_true',
                        help='Hide statistical significance')
     parser.add_argument('--sig-method', choices=['contour', 'boundary'], default='contour',
                        help='Significance visualization method (default: contour)')
-    parser.add_argument('--n-processes', type=int, default=None,
-                       help='Number of processes for parallel computation')
+    parser.add_argument('--n-processes', type=int, default=128,
+                       help='Number of processes for parallel computation (default: min(192, available cores))')
     parser.add_argument('--load-trends', type=str, default=None,
                        help='Load existing trends file instead of calculating')
     parser.add_argument('--calculate-only', action='store_true',
                        help='Calculate and save trends only, skip figure creation')
-    parser.add_argument('--land-only', action='store_true',
-                       help='Shortcut for --mask-type land')
-    parser.add_argument('--ocean-only', action='store_true',
-                       help='Shortcut for --mask-type ocean')
     parser.add_argument('--debug-mask', action='store_true',
-                       help='Create debug figure showing land/ocean mask application')
+                       help='Create debug figure showing land/ocean mask')
+    parser.add_argument('--land-only', action='store_true',
+                       help='Shortcut for --mask-type land (land-only analysis)')
+    parser.add_argument('--ocean-only', action='store_true', 
+                       help='Shortcut for --mask-type ocean (ocean-only analysis)')
     
     args = parser.parse_args()
     
-    # Handle shortcuts
+    # Handle shortcut options
     if args.land_only:
         args.mask_type = 'land'
     elif args.ocean_only:
         args.mask_type = 'ocean'
     
     print("="*80)
-    print("WDXXR CHRONOLOGICAL PRECIPITATION TRENDS ANALYSIS")
+    print("OPTIMIZED PRECIPITATION TRENDS ANALYSIS")
     print("="*80)
-    print(f"Input directory: {args.wd50r_dir}")
+    print(f"Input directory: {args.etccdi_dir}")
     print(f"Output directory: {args.output_dir}")
-    print(f"Percentiles: {args.percentiles}")
     print(f"Analysis domain: {args.mask_type}")
     print(f"Show significance: {not args.no_significance}")
+    print(f"Significance method: {args.sig_method}")
     print(f"Processes: {args.n_processes if args.n_processes else 'auto'}")
     if args.debug_mask:
         print("Debug mask visualization: enabled")
@@ -975,22 +1019,22 @@ def main():
         # Load or calculate trends
         if args.load_trends:
             print(f"Loading existing trends from: {args.load_trends}")
-            trends_data = load_wdxxr_trends_permanent(output_dir, filename=args.load_trends)
+            trends_data = load_trends_permanent(output_dir, filename=args.load_trends)
             if trends_data is None:
                 raise ValueError(f"Could not load trends from {args.load_trends}")
             
             # Load dataset for coordinates (needed for plotting)
-            wdxxr_ds = load_wdxxr_data_optimized(args.wd50r_dir, args.percentiles)
+            etccdi_ds = load_etccdi_data_optimized(args.etccdi_dir)
             
         else:
             # Load data
-            print("Loading WDXXR data...")
-            wdxxr_ds = load_wdxxr_data_optimized(args.wd50r_dir, args.percentiles)
+            print("Loading ETCCDI data...")
+            etccdi_ds = load_etccdi_data_optimized(args.etccdi_dir)
             
             # Define periods
             periods = {
                 '1980-2024': (1980, 2024),
-                '1980-1999': (1980, 1999),
+                '1980-1999': (1980, 1999), 
                 '2000-2024': (2000, 2024)
             }
             
@@ -1000,18 +1044,16 @@ def main():
             
             trends_data = {}
             
-            for percentile in args.percentiles:
-                var_name = f'WD{percentile}R'
-                
-                if var_name not in wdxxr_ds.data_vars:
-                    print(f"Warning: {var_name} not found in dataset")
+            for index_name in ['PRCPTOT', 'R95p', 'R95pTOT']:
+                if index_name not in etccdi_ds.data_vars:
+                    print(f"Warning: {index_name} not found in dataset")
                     continue
                 
-                print(f"\nProcessing {var_name}...")
-                trends_data[var_name] = {}
+                print(f"\nProcessing {index_name}...")
+                trends_data[index_name] = {}
                 
                 for period_name, (start_year, end_year) in periods.items():
-                    period_ds = wdxxr_ds.sel(year=slice(start_year, end_year))
+                    period_ds = etccdi_ds.sel(year=slice(start_year, end_year))
                     period_years = period_ds.year.values.astype(int)
                     
                     if len(period_years) < 4:
@@ -1022,12 +1064,12 @@ def main():
                     period_start = time.time()
                     
                     slopes, p_values, z_stats = calculate_trends_parallel(
-                        period_ds[var_name], period_years, args.n_processes
+                        period_ds[index_name], period_years, args.n_processes
                     )
                     
                     significant = p_values < 0.10
                     
-                    trends_data[var_name][period_name] = {
+                    trends_data[index_name][period_name] = {
                         'slopes': slopes,
                         'p_values': p_values,
                         'z_stats': z_stats,
@@ -1044,15 +1086,15 @@ def main():
             
             # Save trends permanently
             data_info = {
-                'years': sorted([int(y) for y in wdxxr_ds.year.values]),
-                'percentiles': args.percentiles,
+                'years': sorted([int(y) for y in etccdi_ds.year.values]),
+                'variables': ['PRCPTOT', 'R95p', 'R95pTOT'],
                 'periods': {k: [int(v[0]), int(v[1])] for k, v in periods.items()},
-                'shape': [len(wdxxr_ds.latitude), len(wdxxr_ds.longitude)],
-                'lat_range': [float(wdxxr_ds.latitude.min()), float(wdxxr_ds.latitude.max())],
-                'lon_range': [float(wdxxr_ds.longitude.min()), float(wdxxr_ds.longitude.max())]
+                'shape': [len(etccdi_ds.latitude), len(etccdi_ds.longitude)],
+                'lat_range': [float(etccdi_ds.latitude.min()), float(etccdi_ds.latitude.max())],
+                'lon_range': [float(etccdi_ds.longitude.min()), float(etccdi_ds.longitude.max())]
             }
             
-            trends_file = save_wdxxr_trends_permanent(trends_data, data_info, output_dir, args.mask_type)
+            trends_file = save_trends_permanent(trends_data, data_info, output_dir, args.mask_type)
             print(f"\nPermanent trends data saved: {trends_file}")
         
         if args.calculate_only:
@@ -1062,29 +1104,29 @@ def main():
         # Debug mask if requested
         if args.debug_mask:
             print("\nCreating mask debug visualization...")
-            mask_debug = create_optimized_land_ocean_mask(wdxxr_ds, args.mask_type)
-            save_mask_debug_figure(wdxxr_ds, mask_debug, args.mask_type, output_dir)
+            mask_debug = create_optimized_land_ocean_mask(etccdi_ds, args.mask_type)
+            save_mask_debug_figure(etccdi_ds, mask_debug, args.mask_type, output_dir)
         
         # Create figure
-        print("\nCreating WDXXR trends figure...")
-        output_path = create_wdxxr_trends_figure(
-            wdxxr_ds, trends_data, output_dir, args.mask_type,
+        print("\nCreating optimized precipitation trends figure...")
+        output_path = create_optimized_precipitation_figure(
+            etccdi_ds, trends_data, output_dir, args.mask_type,
             show_significance=not args.no_significance,
             significance_method=args.sig_method
         )
         
         print("\n" + "="*80)
-        print("WDXXR ANALYSIS COMPLETED SUCCESSFULLY!")
+        print("ANALYSIS COMPLETED SUCCESSFULLY!")
         print("="*80)
         print(f"Figure saved: {output_path}")
-        print(f"Percentiles analyzed: {args.percentiles}")
-        print("Analysis shows trends in precipitation clustering patterns:")
-        print("- WD25R: Most concentrated events")
-        print("- WD50R: Moderate concentration") 
-        print("- WD75R: Broader patterns")
-        print("- WD90R: Most distributed events")
+        print("Optimizations applied:")
+        print("- Vectorized Mann-Kendall trend analysis")
+        print("- Multiprocessing for parallel computation")
+        print("- Optimized land/ocean masking")
+        print("- Permanent HDF5 data storage")
+        print("- Scientific-grade statistical testing")
         
-        wdxxr_ds.close()
+        etccdi_ds.close()
         
     except Exception as e:
         print(f"Error: {e}")
