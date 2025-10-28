@@ -1,0 +1,215 @@
+================================================================================
+PRECIPITATION INDICES DATASET - ZENODO UPLOAD INFORMATION
+================================================================================
+
+Package Name: Precipitation Concentration and Distribution Indices
+Authors: Saurav Bhattarai, Nawa Raj Pradhan, Rocky Talchabhadel
+Institution: Jackson State University
+Contact: J01013381@students.jsums.edu
+Date Created: October 28, 2025
+Version: 1.0
+
+================================================================================
+PACKAGE CONTENTS
+================================================================================
+
+Total Size: 6.8 GB
+
+1. CODE (13 files)
+   ├── Analysis Scripts (4 files)
+   │   ├── 00_calculate_precipitation_percentiles.py
+   │   ├── 08_ETCCDI_Precipitation_Indices.py
+   │   ├── 09_enhanced_precipitation_concentration_indices.py
+   │   └── 10_WD50R_Chronological_Precipitation_Index.py
+   │
+   └── Visualization Scripts (9 files)
+       ├── baseline_precipitation.py
+       ├── etccdi_trends.py
+       ├── figure3.py
+       ├── median_change.py
+       ├── prcptotwdxxr.py
+       ├── ratio_difference.py
+       ├── trends.py
+       ├── wdxx_trends.py
+       └── wdxxr_trends.py
+
+2. RESULTS (136 files)
+   ├── WD50R Indices: 45 NetCDF files (1980-2024)
+   ├── ETCCDI Indices: 45 NetCDF files (1980-2024)
+   ├── Concentration Indices: 45 NetCDF files (1980-2024)
+   └── Percentiles: 1 NetCDF file (baseline 1980-2000)
+
+3. DOCUMENTATION (3 files)
+   ├── README.md - Complete documentation
+   ├── QUICK_START.md - Quick start guide
+   └── CHANGELOG.md - Package details
+
+================================================================================
+DATASET DESCRIPTION FOR ZENODO
+================================================================================
+
+Title:
+------
+Supplementary Data for: Do the Wettest Days Occur Together? A Global Analysis 
+on Disentangling Precipitation Intensity from Seasonal Timing
+
+Description:
+------------
+This dataset contains global precipitation concentration and distribution indices
+calculated from ERA5 reanalysis data at 0.25° spatial resolution for 1980-2024.
+
+The package includes three main index families:
+
+1. **WDXXR Indices** (Window Duration for XX% of Rainfall)
+   - Novel indices measuring temporal concentration of precipitation
+   - Includes WD25R, WD50R, WD75R for multiple percentiles
+   - Window timing, efficiency metrics, and regime classifications
+
+2. **ETCCDI Indices** (Expert Team on Climate Change Detection and Indices)
+   - Standard precipitation indices: PRCPTOT, SDII, CWD, CDD
+   - Extreme indices: R10mm, R20mm, R95p, R95pTOT
+   - Follows WMO/CCl/CLIVAR guidelines
+
+3. **Concentration Indices**
+   - Gini coefficient (temporal inequality)
+   - Lorenz curve metrics
+   - Shannon entropy
+   - Precipitation concentration factor
+
+All processing code and visualization scripts are included for reproducibility.
+
+Keywords:
+---------
+precipitation, climate indices, WDXXR, ETCCDI, ERA5, temporal concentration,
+climate change, extreme precipitation, Gini coefficient, water resources
+
+Data Format:
+------------
+- NetCDF (CF-compliant)
+- Spatial resolution: 0.25° × 0.25° (721 × 1440 grid)
+- Temporal coverage: 1980-2024 (45 years)
+- Annual indices for each year
+
+Related Publication:
+--------------------
+Bhattarai, S., Pradhan, N.R., and Talchabhadel, R. (2025). Do the Wettest Days 
+Occur Together? A Global Analysis on Disentangling Precipitation Intensity from 
+Seasonal Timing. [In Review]
+
+Data Source:
+------------
+ERA5 Reanalysis: Hersbach et al. (2020)
+DOI: 10.1002/qj.3803
+
+License:
+--------
+CC BY 4.0 (Creative Commons Attribution 4.0 International)
+
+================================================================================
+FILE STRUCTURE
+================================================================================
+
+publication_precipitation_indices/
+│
+├── code/                           # Analysis and visualization scripts
+│   ├── 00_calculate_precipitation_percentiles.py
+│   ├── 08_ETCCDI_Precipitation_Indices.py
+│   ├── 09_enhanced_precipitation_concentration_indices.py
+│   ├── 10_WD50R_Chronological_Precipitation_Index.py
+│   ├── example_full_analysis.sh
+│   └── visualization/              # Paper figures scripts
+│       ├── baseline_precipitation.py
+│       ├── etccdi_trends.py
+│       ├── figure3.py
+│       ├── median_change.py
+│       ├── prcptotwdxxr.py
+│       ├── ratio_difference.py
+│       ├── trends.py
+│       ├── wdxx_trends.py
+│       └── wdxxr_trends.py
+│
+├── results/                        # Calculated indices
+│   ├── wd50r_indices/              # 45 files (1980-2024)
+│   ├── etccdi_indices/             # 45 files (1980-2024)
+│   ├── concentration_indices/      # 45 files (1980-2024)
+│   └── percentiles/                # Baseline climatology
+│
+├── docs/                           # Documentation
+│   └── QUICK_START.md
+│
+├── README.md                       # Main documentation
+├── CHANGELOG.md                    # Package details
+└── ZENODO_UPLOAD_INFO.txt          # This file
+
+================================================================================
+USAGE
+================================================================================
+
+See README.md for:
+- Detailed index descriptions
+- Scientific background
+- Usage examples
+- Interpretation guidelines
+
+See QUICK_START.md for:
+- Quick setup instructions
+- Simple visualization examples
+- Common troubleshooting
+
+See code/ for:
+- Complete analysis pipeline
+- All processing scripts
+- Visualization code for paper figures
+
+================================================================================
+CITING THIS DATASET
+================================================================================
+
+If you use this dataset, please cite:
+
+Bhattarai, S., Pradhan, N.R., and Talchabhadel, R. (2025). Supplementary Data 
+for: Do the Wettest Days Occur Together? A Global Analysis on Disentangling 
+Precipitation Intensity from Seasonal Timing [Data set]. Zenodo. 
+http://doi.org/[TO BE ASSIGNED]
+
+And the underlying ERA5 data:
+
+Hersbach, H., Bell, B., Berrisford, P., et al. (2020). The ERA5 global 
+reanalysis. Quarterly Journal of the Royal Meteorological Society, 146(730), 
+1999-2049. https://doi.org/10.1002/qj.3803
+
+================================================================================
+CONTACT
+================================================================================
+
+Saurav Bhattarai
+Jackson State University
+Email: J01013381@students.jsums.edu
+GitHub: SauravBhattarai19
+
+For questions about:
+- Dataset usage: See README.md or contact via email
+- Code issues: Create issue on GitHub
+- Collaboration: Contact via email
+
+================================================================================
+VERSION HISTORY
+================================================================================
+
+Version 1.0 (October 28, 2025)
+- Initial release
+- 45 years of data (1980-2024)
+- Three index families
+- Complete processing code
+- Visualization scripts included
+
+================================================================================
+ACKNOWLEDGMENTS
+================================================================================
+
+- ERA5 reanalysis data provided by ECMWF
+- ETCCDI guidelines from CCl/CLIVAR/JCOMM Expert Team
+- Computing resources provided by Jackson State University
+
+================================================================================
+

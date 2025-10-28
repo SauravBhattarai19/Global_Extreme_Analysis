@@ -21,6 +21,7 @@ logs/
 # Ignore understanding_indices
 understanding_indices/
 figures/
+WDXX-specific/results/
 
 # Python specific ignores
 __pycache__/
